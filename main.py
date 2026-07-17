@@ -28,6 +28,9 @@ app.include_router(skillscan.router)
 # --- Q8: Red-team guardrail (real read_file / fetch_url execution) ---
 app.include_router(redteam_guardrail.router)
 
+# --- Q6, MCP Server ---
+app.include_router(mcp_server.router)
+
 # --- Q6, Q9, Q10, Q11 will be added here as we build them ---
 #
 # from app_routes import runcontrol
