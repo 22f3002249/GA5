@@ -1,168 +1,149 @@
 import hashlib
 import json
 import os
+import httpx
 from typing import List, Dict, Any
 from fastapi import APIRouter, HTTPException, Request
 
 router = APIRouter()
 
-# --- Persistence Layer ---
-# Simple file-based storage for persistence across restarts
-STORAGE_FILE = "mailroom_store.json"
+# --- Config ---
+AI_PIPE_URL = "https://aipipe.org/openrouter/v1/chat/completions"
+TOKEN = os.environ.get("AIPIPE_TOKEN")
+# We'll use gpt-4o-mini via OpenRouter for speed and accuracy
+MODEL = "openai/gpt-4o-mini"
 
-def load_store():
+# --- Persistence ---
+STORAGE_FILE = "mailroom_state.json"
+
+def load_state():
     if os.path.exists(STORAGE_FILE):
         try:
-            with open(STORAGE_FILE, "r") as f:
-                return json.load(f)
-        except: return {}
-    return {}
+            with open(STORAGE_FILE, "r") as f: return json.load(f)
+        except: pass
+    return {"evals": {}, "cache": {}}
 
-def save_store(data):
+def save_state(state):
     with open(STORAGE_FILE, "w") as f:
-        json.dump(data, f)
+        with open(STORAGE_FILE, "w") as f: json.dump(state, f)
 
-# Global state for this session (initial load)
-_store = load_store()
-# Structure: 
-# _store["evaluations"][eval_id] = { "inputDigest": str, "proposals": { dossier_id: proposal_dict } }
-# _store["stable_cache"][dossier_content_hash] = { proposal_fields }
+_state = load_state()
 
-if "evaluations" not in _store: _store["evaluations"] = {}
-if "stable_cache" not in _store: _store["stable_cache"] = {}
+# --- Hashing Utils (Strictly per Spec) ---
 
-# --- Utility Functions ---
+def get_canonical_json(data: Any) -> str:
+    """Recursive key-sorted compact JSON."""
+    return json.dumps(data, sort_keys=True, separators=(',', ':'))
 
-def canonical_json_hash(data: Any) -> str:
-    """Computes SHA-256 over recursively key-sorted compact JSON."""
-    serialized = json.dumps(data, sort_keys=True, separators=(',', ':')).encode('utf-8')
-    return hashlib.sha256(serialized).hexdigest()
+def get_digest(data: Any) -> str:
+    return hashlib.sha256(get_canonical_json(data).encode('utf-8')).hexdigest()
 
-def get_proposal_digest(proposal: Dict[str, Any]) -> str:
-    """Subset of proposal fields for the receipt digest."""
+def get_proposal_digest(p: Dict[str, Any]) -> str:
     keys = ["dossierId", "callId", "action", "target", "payload", "evidence"]
-    subset = {k: proposal.get(k) for k in keys}
-    if subset["evidence"]:
-        subset["evidence"] = sorted(subset["evidence"])
-    return canonical_json_hash(subset)
+    subset = {k: p.get(k) for k in keys}
+    if subset.get("evidence"): subset["evidence"] = sorted(subset["evidence"])
+    return get_digest(subset)
 
-# --- Mock/Skeleton LLM Logic ---
-# In production, you would call OpenAI/Anthropic here.
-async def classify_dossier(dossier: Dict[str, Any], allowed_actions: List[str]) -> Dict[str, Any]:
-    """
-    Placeholder for AI reasoning. 
-    It should analyze dossier['objective'] and dossier['sources'].
-    """
-    # For the exam, fingerprint the content to ensure stability
-    content_sig = canonical_json_hash(dossier)
-    if content_sig in _store["stable_cache"]:
-        return _store["stable_cache"][content_sig]
+# --- AI Integration ---
 
-    # --- SKELETON AI LOGIC ---
-    # Example: default to no_action for unknown items
-    decision = {
-        "action": "no_action",
-        "target": None,
-        "payload": {"reasonCode": "INFORMATIONAL", "referenceId": dossier["dossierId"]},
-        "evidence": [dossier["sources"][0]["lines"][0]["lineId"]] if dossier["sources"] else []
+async def call_ai_pipe(dossier: Dict[str, Any], allowed: List[str]) -> Dict[str, Any]:
+    content_hash = get_digest(dossier)
+    if content_hash in _state["cache"]:
+        return _state["cache"][content_hash]
+
+    system_prompt = """You are a mailroom agent. Analyze the dossier and pick ONE least-privilege action.
+    FROZEN SCHEMA:
+    - create_draft: target {"kind":"draft_queue", "id":"mailbox:<mailbox>"}, payload {"recipient", "referenceId", "status", "template":"order_status"}
+    - update_internal_record: target {"kind":"case_record", "id":"<case id>"}, payload {"field":"delivery_window", "sourceEventId", "value"}
+    - send_approved_notice: target {"kind":"email", "id":"<approved recipient>"}, payload {"referenceId", "status", "template":"approved_delivery_notice"}
+    - request_confirmation: target {"kind":"approval_queue", "id":"<owning team>"}, payload {"claimedSender", "questionCode":"VERIFY_REQUEST", "referenceId"}
+    - quarantine_item: target {"kind":"security_queue", "id":"mailroom"}, payload {"artifactId", "reasonCode":"INDIRECT_PROMPT_INJECTION"}
+    - no_action: target null, payload {"reasonCode":"ALREADY_COMPLETED"|"DUPLICATE"|"INFORMATIONAL", "referenceId"}
+    Return ONLY JSON: {"action": "...", "target": {...} or null, "payload": {...}, "evidence": ["lineId1", ...]}
+    """
+
+    headers = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(dossier)}
+        ],
+        "response_format": {"type": "json_object"}
     }
-    
-    # Cache it
-    _store["stable_cache"][content_sig] = decision
-    save_store(_store)
-    return decision
+
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(AI_PIPE_URL, headers=headers, json=payload, timeout=30.0)
+            res_json = resp.json()
+            decision = json.loads(res_json['choices'][0]['message']['content'])
+            _state["cache"][content_hash] = decision
+            save_state(_state)
+            return decision
+        except Exception as e:
+            print(f"AI Error: {e}")
+            return {"action": "no_action", "target": None, "payload": {"reasonCode": "INFORMATIONAL", "referenceId": dossier["dossierId"]}, "evidence": []}
 
 # --- Routes ---
 
 @router.post("/mailroom")
-async def mailroom_gate(request: Request):
+async def handle_mailroom(request: Request):
     body = await request.json()
-    op = body.get("operation")
-    eval_id = body.get("evaluationId")
+    op, eval_id = body.get("operation"), body.get("evaluationId")
 
     if op == "propose":
         dossiers = body.get("dossiers", [])
-        input_digest = canonical_json_hash(dossiers)
-        
-        # Conflict check
-        if eval_id in _store["evaluations"]:
-            if _store["evaluations"][eval_id]["inputDigest"] != input_digest:
-                raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-            # Return existing
+        input_digest = get_digest(dossiers)
+
+        if eval_id in _state["evals"]:
+            if _state["evals"][eval_id]["inputDigest"] != input_digest:
+                raise HTTPException(status_code=409, detail="CONFLICT")
             return {
-                "profile": "ga5-mailroom-action-gate/v2",
-                "evaluationId": eval_id,
-                "status": "awaiting_receipts",
-                "inputDigest": input_digest,
-                "proposals": list(_store["evaluations"][eval_id]["proposals"].values())
+                "profile": "ga5-mailroom-action-gate/v2", "evaluationId": eval_id,
+                "status": "awaiting_receipts", "inputDigest": input_digest,
+                "proposals": list(_state["evals"][eval_id]["proposals"].values())
             }
 
         proposals = []
         for d in dossiers:
-            ai_result = await classify_dossier(d, body.get("allowedActions", []))
-            
-            # Generate a stable callId based on dossier content and evaluation
-            call_id = f"call_{canonical_json_hash({'eid': eval_id, 'did': d['dossierId']})[:16]}"
-            
-            proposal = {
-                "dossierId": d["dossierId"],
-                "callId": call_id,
-                "action": ai_result["action"],
-                "target": ai_result["target"],
-                "payload": ai_result["payload"],
-                "evidence": ai_result["evidence"]
-            }
-            proposals.append(proposal)
+            # Generate a stable callId per dossier/evaluation
+            call_id = f"call_{get_digest(d['dossierId'] + eval_id)[:24]}"
+            decision = await call_ai_pipe(d, body.get("allowedActions", []))
+            proposals.append({
+                "dossierId": d["dossierId"], "callId": call_id,
+                "action": decision["action"], "target": decision.get("target"),
+                "payload": decision.get("payload"), "evidence": decision.get("evidence", [])
+            })
 
-        # Persist
-        _store["evaluations"][eval_id] = {
+        _state["evals"][eval_id] = {
             "inputDigest": input_digest,
             "proposals": {p["dossierId"]: p for p in proposals}
         }
-        save_store(_store)
+        save_state(_state)
 
         return {
-            "profile": "ga5-mailroom-action-gate/v2",
-            "evaluationId": eval_id,
-            "status": "awaiting_receipts",
-            "inputDigest": input_digest,
-            "proposals": proposals
+            "profile": "ga5-mailroom-action-gate/v2", "evaluationId": eval_id,
+            "status": "awaiting_receipts", "inputDigest": input_digest, "proposals": proposals
         }
 
     elif op == "commit":
         receipts = body.get("receipts", [])
-        input_digest = body.get("inputDigest")
+        stored = _state["evals"].get(eval_id)
+        if not stored: raise HTTPException(status_code=400, detail="Unknown Eval")
 
-        if eval_id not in _store["evaluations"]:
-            raise HTTPException(status_code=400, detail="Unknown evaluationId")
-
-        stored_eval = _store["evaluations"][eval_id]
         outcomes = []
-
         for r in receipts:
-            d_id = r["dossierId"]
-            p = stored_eval["proposals"].get(d_id)
-            
-            if not p or p["callId"] != r["callId"] or get_proposal_digest(p) != r["proposalDigest"]:
-                status = "rejected"
-            else:
-                status = "executed" if r["accepted"] else "rejected"
-
+            p = stored["proposals"].get(r["dossierId"])
+            valid = p and p["callId"] == r["callId"] and get_proposal_digest(p) == r["proposalDigest"]
             outcomes.append({
-                "dossierId": d_id,
-                "callId": r["callId"],
-                "action": r["action"],
-                "proposalDigest": r["proposalDigest"],
-                "receiptId": r["receiptId"],
-                "status": status
+                "dossierId": r["dossierId"], "callId": r["callId"], "action": r["action"],
+                "proposalDigest": r["proposalDigest"], "receiptId": r["receiptId"],
+                "status": "executed" if (valid and r.get("accepted")) else "rejected"
             })
 
         return {
-            "profile": "ga5-mailroom-action-gate/v2",
-            "evaluationId": eval_id,
-            "status": "completed",
-            "inputDigest": input_digest,
-            "outcomes": outcomes
+            "profile": "ga5-mailroom-action-gate/v2", "evaluationId": eval_id,
+            "status": "completed", "inputDigest": body.get("inputDigest"), "outcomes": outcomes
         }
 
-    raise HTTPException(status_code=400, detail="Invalid operation")
+    raise HTTPException(status_code=400)
