@@ -38,6 +38,10 @@ app.include_router(mcp_server.router)
 app.include_router(mailroom.router)
 
 # --- Q10: A2A ---
+@app.get("/.well-known/agent-card.json")
+async def get_origin_card():
+    # Call the card logic from your a2a module
+    return await a2a.get_card()
 app.include_router(a2a.router, prefix="/a2a")
 
 # Q11 will be added here as we build them ---
