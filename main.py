@@ -10,6 +10,7 @@ from app_routes import guardrail
 from app_routes import runcontrol
 from app_routes import skillscan
 from app_routes import redteam_guardrail
+from app_routes import mcp_server
 
 app = FastAPI(title="exam-endpoints")
 
