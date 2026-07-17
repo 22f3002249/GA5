@@ -3,18 +3,18 @@ import json
 import os
 import asyncio
 import google.generativeai as genai
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from fastapi import APIRouter, Request, Response, HTTPException, Header, Depends
+from fastapi.responses import JSONResponse
 
 router = APIRouter()
 
 # --- Configuration ---
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
-if GEMINI_KEY:
-    genai.configure(api_key=GEMINI_KEY)
-ai_model = genai.GenerativeModel('gemini-1.5-flash')
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+# Using the explicit model path to avoid the 404 seen in your logs
+model_name = "models/gemini-1.5-flash"
+ai_model = genai.GenerativeModel(model_name)
 
-# Base URL from Render Environment (e.g., https://yourapp.onrender.com/a2a)
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 
 # --- Persistence ---
@@ -35,13 +35,18 @@ async def save_state():
         with open(STORAGE_FILE, "w") as f:
             json.dump(_state, f)
 
+# --- A2A Response Helper ---
+
+class A2AResponse(JSONResponse):
+    """Custom response to ensure the strict application/a2a+json media type."""
+    media_type = "application/a2a+json"
+
 # --- Helper Functions ---
 
 def get_fingerprint(data: Any) -> str:
-    """Recursively key-sorted compact JSON hash."""
     return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
-async def validate_a2a_request(request: Request, a2a_version: str = Header(None)):
+async def validate_a2a(request: Request, a2a_version: str = Header(None)):
     """Enforces protocol version and authentication."""
     if a2a_version != "1.0":
         raise HTTPException(status_code=400, detail="Require A2A-Version: 1.0")
@@ -49,26 +54,12 @@ async def validate_a2a_request(request: Request, a2a_version: str = Header(None)
     auth = request.headers.get("Authorization")
     if not auth or not auth.startswith("Bearer "):
         raise HTTPException(status_code=401)
-    
-    # Return the token string as the 'Principal ID' for tenant isolation
     return auth.split(" ")[1]
 
 async def analyze_invoice_batch(packages: List[Dict]) -> List[Dict]:
-    """Calls Gemini to classify the batch of invoices."""
-    prompt = f"""You are a professional invoice auditing agent. 
-    Analyze the following invoice packages and assign EXACTLY ONE business action to each.
-    
-    ALLOWED ACTIONS:
-    - settle_invoice: Valid, matched to records, within authority.
-    - request_approval: Commercially valid but exceeds spending limit.
-    - hold_invoice: Payment paused pending specific verification.
-    - reject_duplicate: This specific invoice number was already paid.
-    - open_exception: Data mismatch between records (e.g. amount or vendor mismatch).
-
-    Return ONLY a JSON list of objects with these keys: 
-    packageId, actionId (uuid), action, facts (object with vendorName, invoiceNumber, amountMinor, currency), 
-    evidenceRefs (list of specific strings), rationale (60-1500 chars).
-    
+    prompt = f"""You are an invoice audit agent. Pick ONE action for each package: 
+    settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception.
+    Return ONLY a JSON list of objects with: packageId, actionId, action, facts, evidenceRefs, rationale.
     DATA: {json.dumps(packages)}"""
 
     try:
@@ -78,16 +69,15 @@ async def analyze_invoice_batch(packages: List[Dict]) -> List[Dict]:
         )
         return json.loads(res.text)
     except Exception as e:
-        print(f"AI_FAILURE: {e}")
+        print(f"AI_ERR: {e}")
         return []
 
-# --- Protocol Implementation ---
+# --- Routes ---
 
 async def get_card_data():
-    """Logic for the public Agent Card."""
     return {
-        "name": "Invoice Audit Agent",
-        "description": "Analyzes messy invoice batches and manages business approval workflows.",
+        "name": "Invoice Agent",
+        "description": "A2A 1.0 compliant invoice processing agent.",
         "version": "1.0.0",
         "capabilities": {"invoice_processing": {}},
         "supportedInterfaces": [{
@@ -104,32 +94,28 @@ async def get_card_data():
 
 @router.get("/.well-known/agent-card.json")
 async def public_card():
-    """Handles the card route if it's called at the sub-path."""
+    # Note: Spec says card is public, so no version check/auth here
     return await get_card_data()
 
 @router.post("/message:send")
-async def message_send(request: Request, principal: str = Depends(validate_a2a_request)):
+async def message_send(request: Request, principal: str = Depends(validate_a2a)):
     body = await request.json()
     msg = body.get("message", {})
     msg_id = msg.get("messageId")
     parts = msg.get("parts", [])
     
-    # 1. Idempotency Check (Principal + MessageId must be unique)
     idem_key = f"{principal}:{msg_id}"
     if idem_key in _state["idempotency"]:
         task_id = _state["idempotency"][idem_key]
-        # Return same task, but check for content conflict (Optional but good)
-        return {"task": _state["tasks"][task_id]}
+        return A2AResponse({"task": _state["tasks"][task_id]["data"]})
 
     if not parts: raise HTTPException(status_code=400)
     media_type = parts[0]["mediaType"]
 
-    # --- CASE 1: Initial Invoice Batch ---
     if media_type == "application/vnd.ga5.invoice-claim-batch+json":
         data = parts[0]["data"]
-        task_id = f"task_{get_fingerprint(msg_id)[:12]}"
+        task_id = f"t_{get_fingerprint(msg_id)[:12]}"
         
-        # Semantic Reasoning
         proposals = await analyze_invoice_batch(data["packages"])
         
         task = {
@@ -143,21 +129,19 @@ async def message_send(request: Request, principal: str = Depends(validate_a2a_r
             }]
         }
         
-        # Persist (Isolated to this principal)
         _state["tasks"][task_id] = {"data": task, "owner": principal}
         _state["idempotency"][idem_key] = task_id
         await save_state()
-        return {"task": task}
+        return A2AResponse({"task": task})
 
-    # --- CASE 2: Receiving Acceptance Nonces (Commit) ---
     elif media_type == "application/vnd.ga5.invoice-action-results+json":
         task_id = msg.get("taskId")
         if task_id not in _state["tasks"]: raise HTTPException(status_code=404)
         
-        stored_entry = _state["tasks"][task_id]
-        if stored_entry["owner"] != principal: raise HTTPException(status_code=403)
+        entry = _state["tasks"][task_id]
+        if entry["owner"] != principal: raise HTTPException(status_code=403)
         
-        task = stored_entry["data"]
+        task = entry["data"]
         results_data = parts[0]["data"]
         proposals = task["artifacts"][0]["data"]["proposals"]
         
@@ -166,7 +150,6 @@ async def message_send(request: Request, principal: str = Depends(validate_a2a_r
             if res["outcome"] == "ACCEPTED":
                 match = next((p for p in proposals if p["actionId"] == res["actionId"]), None)
                 if match:
-                    # Bind the proposal to the receipt nonce
                     executions.append({**match, "receiptNonce": res["receiptNonce"]})
         
         task["state"] = "TASK_STATE_COMPLETED"
@@ -175,19 +158,19 @@ async def message_send(request: Request, principal: str = Depends(validate_a2a_r
             "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
             "data": {"batchId": results_data["batchId"], "executions": executions}
         })
-        
         await save_state()
-        return {"task": task}
+        return A2AResponse({"task": task})
 
     raise HTTPException(status_code=400)
 
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: str, principal: str = Depends(validate_a2a_request)):
+async def get_task(task_id: str, principal: str = Depends(validate_a2a)):
     if task_id not in _state["tasks"]: raise HTTPException(status_code=404)
     entry = _state["tasks"][task_id]
     if entry["owner"] != principal: raise HTTPException(status_code=404)
-    return entry["data"]
+    return A2AResponse(entry["data"])
 
 @router.get("/tasks")
-async def list_tasks(principal: str = Depends(validate_a2a_request)):
-    return {"tasks": [t["data"] for t in _state["tasks"].values() if t["owner"] == principal]}
+async def list_tasks(principal: str = Depends(validate_a2a)):
+    tasks = [t["data"] for t in _state["tasks"].values() if t["owner"] == principal]
+    return A2AResponse({"tasks": tasks})
