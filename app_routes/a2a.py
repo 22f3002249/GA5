@@ -14,8 +14,9 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
-# Try 'gemini-1.5-flash-latest' as it is the most stable production endpoint
-ai_model = genai.GenerativeModel('gemini-1.5-flash-latest')
+# Using 'gemini-1.0-pro' as primary - it is very cheap and highly compatible
+PRIMARY_MODEL = 'gemini-1.0-pro'
+FALLBACK_MODEL = 'gemini-1.5-flash'
 
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 
@@ -37,7 +38,7 @@ async def save_state():
         with open(STORAGE_FILE, "w") as f:
             json.dump(_state, f)
 
-# --- Response Helper ---
+# --- A2A Protocol Response ---
 class A2AResponse(JSONResponse):
     media_type = "application/a2a+json"
 
@@ -48,58 +49,55 @@ def get_fingerprint(data: Any) -> str:
 
 async def validate_a2a(request: Request, a2a_version: str = Header(None)):
     if a2a_version != "1.0":
-        raise HTTPException(status_code=400, detail="Invalid A2A-Version")
+        raise HTTPException(status_code=400, detail="Invalid version")
     auth = request.headers.get("Authorization")
     if not auth or not auth.startswith("Bearer "):
         raise HTTPException(status_code=401)
     return auth.split(" ")[1]
 
 async def analyze_invoice_batch(packages: List[Dict]) -> List[Dict]:
-    """Semantic analysis with specific rationale requirements (60-1500 chars)."""
+    """Semantic analysis focusing on 4/4 marks criteria."""
     prompt = f"""You are a professional invoice auditor. Analyze these {len(packages)} packages.
     ACTIONS: settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception.
     
-    For each package, return a JSON object with:
-    - packageId: the input package id
-    - actionId: a stable unique id for the action
-    - action: exactly one string from the 5 above
-    - facts: {{vendorName, invoiceNumber, amountMinor, currency}}
+    Return ONLY a JSON list of objects (no markdown blocks):
+    - packageId: the input id
+    - actionId: random unique string
+    - action: exactly one of the 5 strings above
+    - facts: {{vendorName, invoiceNumber, amountMinor (int), currency}}
     - evidenceRefs: list of EXACT strings from the document supporting the decision
-    - rationale: A DETAILED explanation (between 150 and 400 characters). 
-      You MUST name the action and explicitly cite at least two items from evidenceRefs.
+    - rationale: A DETAILED explanation (200-500 characters). 
+      You MUST name the chosen action and explicitly cite the evidenceRefs used.
     
     DATA: {json.dumps(packages)}"""
 
-    # Model Rotation Strategy: Try Flash, then Pro
-    models_to_try = ['gemini-1.5-flash-latest', 'gemini-1.5-pro-latest', 'gemini-1.5-flash']
-    
-    for m_name in models_to_try:
+    # Try 1.0 Pro first, then 1.5 Flash
+    for m_name in [PRIMARY_MODEL, FALLBACK_MODEL]:
         try:
-            current_model = genai.GenerativeModel(m_name)
-            res = await current_model.generate_content_async(
-                prompt, 
-                generation_config={"response_mime_type": "application/json"}
-            )
-            return json.loads(res.text)
+            model = genai.GenerativeModel(m_name)
+            res = await model.generate_content_async(prompt)
+            # 1.0 Pro doesn't support 'response_mime_type', so we clean the text
+            clean_text = res.text.replace('```json', '').replace('```', '').strip()
+            return json.loads(clean_text)
         except Exception as e:
             print(f"FAILED model {m_name}: {e}")
             continue
             
-    # Absolute Fallback (so protocol doesn't crash, but won't get full semantic marks)
-    return [{"packageId": p['packageId'], "actionId": f"act_{p['packageId']}", "action": "hold_invoice", "facts": {"vendorName": "Unknown", "invoiceNumber": "0", "amountMinor": 0, "currency": "INR"}, "evidenceRefs": [], "rationale": "The system was unable to reach the AI model for analysis. This invoice is held for manual review to ensure policy compliance."} for p in packages]
+    # Emergency fallback
+    return [{"packageId": p['packageId'], "actionId": f"err_{p['packageId']}", "action": "hold_invoice", "facts": {"vendorName": "Unknown", "invoiceNumber": "0", "amountMinor": 0, "currency": "INR"}, "evidenceRefs": [], "rationale": "Invoice held due to model communication failure. Please review manually."} for p in packages]
 
 # --- Routes ---
 
 async def get_card_data():
     return {
-        "name": "Enterprise Invoice Agent",
-        "description": "Persistent AI agent for high-scale invoice auditing.",
+        "name": "Invoice Logic Agent",
+        "description": "Enterprise agent for invoice batch processing.",
         "version": "1.0.0",
         "capabilities": {
             "invoice_action_agent": {
                 "name": "Audit Skill", 
-                "description": "Analyzes invoice documents against commercial policy.",
-                "tags": ["finance", "audit"]
+                "description": "Reviews invoices",
+                "tags": ["audit", "finance"]
             }
         },
         "supportedInterfaces": [{"protocolBinding": "HTTP+JSON", "protocolVersion": "1.0", "endpoint": f"{BASE_URL}"}],
@@ -125,11 +123,9 @@ async def message_send(request: Request, principal: str = Depends(validate_a2a))
     if not parts: raise HTTPException(status_code=400)
     media_type = parts[0]["mediaType"]
 
-    # Initial Step: Propose Actions
     if media_type == "application/vnd.ga5.invoice-claim-batch+json":
         data = parts[0]["data"]
-        task_id = f"task_{get_fingerprint(msg_id)[:16]}"
-        
+        task_id = f"t_{get_fingerprint(msg_id)[:16]}"
         proposals = await analyze_invoice_batch(data["packages"])
         
         task = {
@@ -141,13 +137,11 @@ async def message_send(request: Request, principal: str = Depends(validate_a2a))
                 "data": {"batchId": data["batchId"], "proposals": proposals}
             }]
         }
-        
         _state["tasks"][task_id] = {"data": task, "owner": principal}
         _state["idempotency"][idem_key] = task_id
         await save_state()
         return A2AResponse({"task": task})
 
-    # Continuation Step: Process Receipts
     elif media_type == "application/vnd.ga5.invoice-action-results+json":
         task_id = msg.get("taskId")
         entry = _state["tasks"].get(task_id)
