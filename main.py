@@ -7,6 +7,7 @@ here under its own path prefix. This file only wires things together.
 from fastapi import FastAPI
 from app_routes import proration
 from app_routes import guardrail
+from app_routes import runcontrol
 
 app = FastAPI(title="exam-endpoints")
 
@@ -16,7 +17,10 @@ app.include_router(proration.router)
 # --- Q3: Pre-tool-call guardrail ---
 app.include_router(guardrail.router)
 
-# --- Q5, Q6, Q8, Q9, Q10, Q11 will be added here as we build them ---
+# --- Q5: Run-budget-and-loop-guard ---
+app.include_router(runcontrol.router)
+
+# --- Q6, Q8, Q9, Q10, Q11 will be added here as we build them ---
 #
 # from app_routes import runcontrol
 # app.include_router(runcontrol.router)
