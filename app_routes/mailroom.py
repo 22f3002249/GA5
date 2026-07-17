@@ -10,7 +10,7 @@ router = APIRouter()
 
 # --- Config ---
 # OpenRouter bridge via AI Pipe
-AI_PIPE_URL = "https://aipipe.org/openai/v1"
+AI_PIPE_URL = "https://aipipe.org/openai/v1/chat/completions"
 TOKEN = os.environ.get("AIPIPE_TOKEN")
 MODEL = "gpt-4o-mini" # Fast and accurate for this task
 
