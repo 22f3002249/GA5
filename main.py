@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from app_routes import proration
 from app_routes import guardrail
 from app_routes import runcontrol
+from app_routes import skillscan
 
 app = FastAPI(title="exam-endpoints")
 
@@ -19,6 +20,9 @@ app.include_router(guardrail.router)
 
 # --- Q5: Run-budget-and-loop-guard ---
 app.include_router(runcontrol.router)
+
+# --- Q4: Skill vulnerability scanner ---
+app.include_router(skillscan.router)
 
 # --- Q6, Q8, Q9, Q10, Q11 will be added here as we build them ---
 #
