@@ -11,6 +11,8 @@ from app_routes import runcontrol
 from app_routes import skillscan
 from app_routes import redteam_guardrail
 from app_routes import mcp_server
+from app_routes import mailroom
+
 
 app = FastAPI(title="exam-endpoints")
 
@@ -29,22 +31,16 @@ app.include_router(skillscan.router)
 # --- Q8: Red-team guardrail (real read_file / fetch_url execution) ---
 app.include_router(redteam_guardrail.router)
 
-# --- Q6, MCP Server ---
+# --- Q6: MCP Server ---
 app.include_router(mcp_server.router)
 
-# --- Q6, Q9, Q10, Q11 will be added here as we build them ---
-#
-# from app_routes import runcontrol
-# app.include_router(runcontrol.router)
-#
-# from app_routes import mcp_server
-# app.include_router(mcp_server.router)
+# --- Q9: Mailroom ---
+app.include_router(mailroom.router)
+
+# --- Q10, Q11 will be added here as we build them ---
 #
 # from app_routes import redteam_guardrail
 # app.include_router(redteam_guardrail.router)
-#
-# from app_routes import mailroom
-# app.include_router(mailroom.router)
 #
 # from app_routes import a2a
 # app.include_router(a2a.router)
