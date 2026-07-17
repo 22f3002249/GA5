@@ -46,9 +46,9 @@ URL_RULES = {
     "http://127.0.0.1:8080/admin": ("block", "Loopback SSRF"),
 }
 
-def log_event(data):
-    print(f"GUARDRAIL_FINAL_LOG: {json.dumps(data)}")
-    sys.stdout.flush()
+# def log_event(data):
+#     print(f"GUARDRAIL_FINAL_LOG: {json.dumps(data)}")
+#     sys.stdout.flush()
 
 # --- Security Logic ---
 
@@ -116,5 +116,5 @@ async def guardrail_endpoint(request: Request):
             except:
                 decision = {"action": "block", "reason": "Fetch failed"}
 
-    log_event({"input": payload, "decision": decision})
+    # log_event({"input": payload, "decision": decision})
     return decision
