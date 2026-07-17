@@ -9,6 +9,7 @@ from app_routes import proration
 from app_routes import guardrail
 from app_routes import runcontrol
 from app_routes import skillscan
+from app_routes import redteam_guardrail
 
 app = FastAPI(title="exam-endpoints")
 
@@ -24,7 +25,10 @@ app.include_router(runcontrol.router)
 # --- Q4: Skill vulnerability scanner ---
 app.include_router(skillscan.router)
 
-# --- Q6, Q8, Q9, Q10, Q11 will be added here as we build them ---
+# --- Q8: Red-team guardrail (real read_file / fetch_url execution) ---
+app.include_router(redteam_guardrail.router)
+
+# --- Q6, Q9, Q10, Q11 will be added here as we build them ---
 #
 # from app_routes import runcontrol
 # app.include_router(runcontrol.router)
