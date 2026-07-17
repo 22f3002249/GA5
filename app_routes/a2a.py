@@ -16,7 +16,7 @@ if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
 # Using Gemini 2.0 Flash Lite (the newest efficient model)
-MODEL_ID = "gemini-3-flash"
+MODEL_ID = "gemini-3.5-flash"
 ai_model = genai.GenerativeModel(MODEL_ID)
 
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
