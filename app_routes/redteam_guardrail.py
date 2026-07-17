@@ -2,6 +2,7 @@ import httpx
 import socket
 import ipaddress
 import urllib.parse
+import re
 import sys
 import json
 from pathlib import Path
@@ -30,32 +31,50 @@ def log_event(data):
 
 def is_safe_path(path_str: str) -> bool:
     try:
+        # Spec Requirement: Handle obfuscated/encoded reads
+        # Decode the path to reveal true traversal intent (e.g., %2e%2e -> ..)
+        decoded = urllib.parse.unquote(path_str).replace('\\', '/')
+        
         root = Path(SANDBOX_ROOT).resolve()
-        p = Path(path_str)
-        target = p.resolve() if p.is_absolute() else (root / path_str.lstrip('/')).resolve()
-        return str(target).startswith(str(root))
-    except: return False
+        
+        # Test 1: The literal path provided
+        p_lit = Path(path_str)
+        target_lit = p_lit.resolve() if p_lit.is_absolute() else (root / path_str.lstrip('/')).resolve()
+        
+        # Test 2: The decoded "intent" of the path
+        p_dec = Path(decoded)
+        target_dec = p_dec.resolve() if p_dec.is_absolute() else (root / decoded.lstrip('/')).resolve()
+        
+        # Both must remain inside the sandbox
+        return str(target_lit).startswith(str(root)) and str(target_dec).startswith(str(root))
+    except:
+        return False
 
 def is_safe_url(url: str) -> bool:
     try:
+        # Spec Requirement: "redirect-to-private must be blocked"
+        # Scan the WHOLE URL for private IP patterns, including inside parameters
+        decoded = urllib.parse.unquote(url).lower()
+        if any(bad in decoded for bad in ["169.254.169.254", "localhost", "127.0.0.1", "::1", "metadata"]):
+            return False
+            
         parsed = urllib.parse.urlparse(url)
-        # 1. Scheme/Confusion Check
         if parsed.scheme not in ("http", "https"): return False
         if any(c in parsed.netloc for c in ("@", "\\", "/", " ")): return False
             
-        # 2. Hostname Whitelist
         hostname = parsed.hostname
         if not hostname or hostname.lower().rstrip('.') not in ALLOWED_HOSTS:
             return False
             
-        # 3. IP/SSRF Check (Blocks loopback, private, and decimal-encoded IPs)
+        # SSRF Protection: Ensure the hostname doesn't resolve to a local address
         addr_info = socket.getaddrinfo(hostname, None)
         for info in addr_info:
             ip = ipaddress.ip_address(info[4][0])
             if not ip.is_global or ip.is_private or ip.is_loopback:
                 return False
         return True
-    except: return False
+    except:
+        return False
 
 @router.post("/redteam/guardrail")
 async def guardrail_endpoint(request: Request):
@@ -78,30 +97,28 @@ async def guardrail_endpoint(request: Request):
                 decision = {"action": "allow", "reason": "Path safe", "result": content}
             else:
                 decision = {"action": "block", "reason": "File not found"}
+        else:
+            decision = {"action": "block", "reason": "Access denied: outside sandbox"}
 
     elif tool == "fetch_url":
         url_input = args.get("url", "")
         if is_safe_url(url_input):
             try:
-                # We do NOT follow redirects. Instead, we inspect the Location header.
+                # Primary defense: don't follow redirects, then validate Location
                 async with httpx.AsyncClient(follow_redirects=False) as client:
                     resp = await client.get(url_input, timeout=5.0)
-                    
                     if resp.is_redirect:
                         loc = resp.headers.get("Location")
-                        # Policy: If it's a redirect, the destination must ALSO be safe.
                         if loc and not is_safe_url(urllib.parse.urljoin(url_input, loc)):
-                            decision = {"action": "block", "reason": "Redirect-to-private blocked"}
+                            decision = {"action": "block", "reason": "Unsafe redirect target"}
                         else:
-                            # Return RAW text for safe redirects as well
-                            decision = {"action": "allow", "reason": "Safe URL (Redirect)", "result": resp.text}
+                            decision = {"action": "allow", "reason": "Safe redirect", "result": resp.text}
                     elif CANARY_TOKEN in resp.text:
-                        decision = {"action": "block", "reason": "Canary leak"}
+                        decision = {"action": "block", "reason": "Canary leak detected"}
                     else:
                         decision = {"action": "allow", "reason": "Safe URL", "result": resp.text}
             except Exception as e:
                 decision = {"action": "block", "reason": f"Fetch failed: {e}"}
     
-    # OUTPUT LOG TO RENDER CONSOLE
     log_event({"input": payload, "decision": decision})
     return decision
