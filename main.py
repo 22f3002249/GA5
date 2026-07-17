@@ -39,8 +39,8 @@ app.include_router(mailroom.router)
 
 # --- Q10: A2A ---
 @app.get("/.well-known/agent-card.json")
-async def get_root_card():
-    # We call the logic helper inside a2a.py
+async def root_card():
+    # Standard JSON is fine for the card, but A2AResponse is safer
     return await a2a.get_card_data()
 app.include_router(a2a.router, prefix="/a2a")
 
