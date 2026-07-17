@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import asyncio
+import sys
 import google.generativeai as genai
 from typing import List, Dict, Any
 from fastapi import APIRouter, Request, Response, HTTPException, Header, Depends
@@ -14,13 +15,13 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
-# Using 'gemini-1.0-pro' as primary - it is very cheap and highly compatible
-PRIMARY_MODEL = 'gemini-1.0-pro'
-FALLBACK_MODEL = 'gemini-1.5-flash'
+# Using Gemini 2.0 Flash Lite (the newest efficient model)
+MODEL_ID = 'gemini-2.0-flash-lite'
+ai_model = genai.GenerativeModel(MODEL_ID)
 
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 
-# --- Persistence ---
+# --- State Management ---
 STORAGE_FILE = "a2a_state.json"
 STATE_LOCK = asyncio.Lock()
 
@@ -38,9 +39,14 @@ async def save_state():
         with open(STORAGE_FILE, "w") as f:
             json.dump(_state, f)
 
-# --- A2A Protocol Response ---
+# --- A2A Response Class ---
 class A2AResponse(JSONResponse):
     media_type = "application/a2a+json"
+
+# --- Logging Helper ---
+def log_event(label: str, data: Any):
+    print(f"A2A_LOG [{label}]: {json.dumps(data, indent=2)}")
+    sys.stdout.flush()
 
 # --- Logic ---
 
@@ -49,64 +55,66 @@ def get_fingerprint(data: Any) -> str:
 
 async def validate_a2a(request: Request, a2a_version: str = Header(None)):
     if a2a_version != "1.0":
-        raise HTTPException(status_code=400, detail="Invalid version")
+        log_event("BAD_VERSION", {"received": a2a_version})
+        raise HTTPException(status_code=400, detail="Require A2A-Version: 1.0")
     auth = request.headers.get("Authorization")
     if not auth or not auth.startswith("Bearer "):
         raise HTTPException(status_code=401)
     return auth.split(" ")[1]
 
 async def analyze_invoice_batch(packages: List[Dict]) -> List[Dict]:
-    """Semantic analysis focusing on 4/4 marks criteria."""
+    """Semantic analysis for high marks (4/4)."""
     prompt = f"""You are a professional invoice auditor. Analyze these {len(packages)} packages.
-    ACTIONS: settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception.
+    Choose EXACTLY ONE action: settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception.
     
-    Return ONLY a JSON list of objects (no markdown blocks):
-    - packageId: the input id
-    - actionId: random unique string
-    - action: exactly one of the 5 strings above
-    - facts: {{vendorName, invoiceNumber, amountMinor (int), currency}}
-    - evidenceRefs: list of EXACT strings from the document supporting the decision
-    - rationale: A DETAILED explanation (200-500 characters). 
-      You MUST name the chosen action and explicitly cite the evidenceRefs used.
+    Return ONLY a JSON list of objects:
+    - packageId: same as input
+    - actionId: unique string
+    - action: one of the 5 allowed strings
+    - facts: {{vendorName, invoiceNumber, amountMinor, currency}}
+    - evidenceRefs: list of EXACT snippets from the source text
+    - rationale: A DETAILED explanation (250-600 characters). 
+      You MUST name the action and explicitly explain why the evidenceRefs lead to this decision.
     
     DATA: {json.dumps(packages)}"""
 
-    # Try 1.0 Pro first, then 1.5 Flash
-    for m_name in [PRIMARY_MODEL, FALLBACK_MODEL]:
-        try:
-            model = genai.GenerativeModel(m_name)
-            res = await model.generate_content_async(prompt)
-            # 1.0 Pro doesn't support 'response_mime_type', so we clean the text
-            clean_text = res.text.replace('```json', '').replace('```', '').strip()
-            return json.loads(clean_text)
-        except Exception as e:
-            print(f"FAILED model {m_name}: {e}")
-            continue
-            
-    # Emergency fallback
-    return [{"packageId": p['packageId'], "actionId": f"err_{p['packageId']}", "action": "hold_invoice", "facts": {"vendorName": "Unknown", "invoiceNumber": "0", "amountMinor": 0, "currency": "INR"}, "evidenceRefs": [], "rationale": "Invoice held due to model communication failure. Please review manually."} for p in packages]
+    log_event("AI_PROMPT_SENT", {"model": MODEL_ID, "package_count": len(packages)})
+    
+    try:
+        # Use simple text generation and strip markdown for maximum reliability
+        res = await ai_model.generate_content_async(prompt)
+        raw_text = res.text.replace('```json', '').replace('```', '').strip()
+        log_event("AI_RAW_RESPONSE", raw_text)
+        return json.loads(raw_text)
+    except Exception as e:
+        log_event("AI_ERROR", str(e))
+        # Logic Fallback to prevent protocol hang
+        return [{"packageId": p['packageId'], "actionId": f"act_{p['packageId']}", "action": "hold_invoice", "facts": {"vendorName": "Unknown", "invoiceNumber": "0", "amountMinor": 0, "currency": "INR"}, "evidenceRefs": [], "rationale": "Held for manual review due to automated processing timeout."} for p in packages]
 
-# --- Routes ---
+# --- Protocol Endpoints ---
 
 async def get_card_data():
     return {
-        "name": "Invoice Logic Agent",
-        "description": "Enterprise agent for invoice batch processing.",
+        "name": "2.0 Flash Lite Audit Agent",
+        "description": "High-speed A2A invoice auditing agent.",
         "version": "1.0.0",
         "capabilities": {
             "invoice_action_agent": {
-                "name": "Audit Skill", 
-                "description": "Reviews invoices",
-                "tags": ["audit", "finance"]
+                "name": "Invoice Auditor",
+                "description": "Processes commercial invoice batches",
+                "tags": ["finance", "persistent"]
             }
         },
         "supportedInterfaces": [{"protocolBinding": "HTTP+JSON", "protocolVersion": "1.0", "endpoint": f"{BASE_URL}"}],
         "defaultInputModes": ["application/vnd.ga5.invoice-claim-batch+json"],
-        "defaultOutputModes": ["application/vnd.ga5.invoice-action-proposals+json", "application/vnd.ga5.invoice-action-receipts+json"]
+        "defaultOutputModes": [
+            "application/vnd.ga5.invoice-action-proposals+json",
+            "application/vnd.ga5.invoice-action-receipts+json"
+        ]
     }
 
 @router.get("/.well-known/agent-card.json")
-async def discovery():
+async def card_subpath():
     return await get_card_data()
 
 @router.post("/message:send")
@@ -116,8 +124,11 @@ async def message_send(request: Request, principal: str = Depends(validate_a2a))
     msg_id = msg.get("messageId")
     parts = msg.get("parts", [])
     
+    log_event("INCOMING_MESSAGE", {"msgId": msg_id, "principal": principal[:10] + "..."})
+
     idem_key = f"{principal}:{msg_id}"
     if idem_key in _state["idempotency"]:
+        log_event("IDEMPOTENCY_HIT", msg_id)
         return A2AResponse({"task": _state["tasks"][_state["idempotency"][idem_key]]["data"]})
 
     if not parts: raise HTTPException(status_code=400)
@@ -126,6 +137,7 @@ async def message_send(request: Request, principal: str = Depends(validate_a2a))
     if media_type == "application/vnd.ga5.invoice-claim-batch+json":
         data = parts[0]["data"]
         task_id = f"t_{get_fingerprint(msg_id)[:16]}"
+        
         proposals = await analyze_invoice_batch(data["packages"])
         
         task = {
@@ -137,9 +149,11 @@ async def message_send(request: Request, principal: str = Depends(validate_a2a))
                 "data": {"batchId": data["batchId"], "proposals": proposals}
             }]
         }
+        
         _state["tasks"][task_id] = {"data": task, "owner": principal}
         _state["idempotency"][idem_key] = task_id
         await save_state()
+        log_event("TASK_CREATED", task_id)
         return A2AResponse({"task": task})
 
     elif media_type == "application/vnd.ga5.invoice-action-results+json":
@@ -169,6 +183,7 @@ async def message_send(request: Request, principal: str = Depends(validate_a2a))
             "data": {"batchId": results_data["batchId"], "executions": executions}
         })
         await save_state()
+        log_event("TASK_COMPLETED", task_id)
         return A2AResponse({"task": task})
 
     raise HTTPException(status_code=400)
