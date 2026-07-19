@@ -215,8 +215,15 @@ def extract_json_object(text: str) -> dict:
     raise ValueError("Could not extract JSON from model output")
 
 
+CHUNK_SIZE = int(os.environ.get("AI_CHUNK_SIZE", "5"))
+MAX_CONCURRENT_CALLS = int(os.environ.get("AI_MAX_CONCURRENT", "6"))
+
+
 async def call_ai_batch(dossiers: List[Dict[str, Any]], client: httpx.AsyncClient) -> Dict[str, Dict[str, Any]]:
-    """Returns a dict keyed by dossierId -> raw decision (pre-schema-enforcement)."""
+    """Returns a dict keyed by dossierId -> raw decision (pre-schema-enforcement).
+    Splits work into small chunks run concurrently, so each call stays well
+    within the model's context window and the grader's per-request time
+    budget, while still being far cheaper than one call per dossier."""
     if not dossiers:
         return {}
 
@@ -231,46 +238,52 @@ async def call_ai_batch(dossiers: List[Dict[str, Any]], client: httpx.AsyncClien
             for d in dossiers
         }
 
-    user_content = json.dumps({"dossiers": dossiers})
-    combined_prompt = SYSTEM_PROMPT + "\n\n--- DOSSIERS TO TRIAGE ---\n" + user_content
-    base_payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "user", "content": combined_prompt},
-        ],
-    }
+    chunks = [dossiers[i:i + CHUNK_SIZE] for i in range(0, len(dossiers), CHUNK_SIZE)]
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
 
-    async def attempt(use_json_mode: bool):
-        payload = dict(base_payload)
-        if use_json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        resp = await client.post(
-            AI_PIPE_URL,
-            headers={"Authorization": f"Bearer {TOKEN}"},
-            json=payload,
-            timeout=90.0,
-        )
-        if resp.status_code >= 400:
-            print(f"HF_API_ERROR status={resp.status_code} body={resp.text[:1000]}")
-        resp.raise_for_status()
-        res_data = resp.json()
-        raw_text = res_data["choices"][0]["message"]["content"]
-        return extract_json_object(raw_text)
+    async def run_chunk(chunk: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        async with semaphore:
+            user_content = json.dumps({"dossiers": chunk})
+            combined_prompt = SYSTEM_PROMPT + "\n\n--- DOSSIERS TO TRIAGE ---\n" + user_content
+            base_payload = {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": combined_prompt}],
+            }
 
-    try:
-        try:
-            parsed = await attempt(use_json_mode=True)
-        except Exception as e1:
-            print(f"AI_ATTEMPT1_FAILED (json_mode): {e1}")
-            parsed = await attempt(use_json_mode=False)
+            async def attempt(use_json_mode: bool):
+                payload = dict(base_payload)
+                if use_json_mode:
+                    payload["response_format"] = {"type": "json_object"}
+                resp = await client.post(
+                    AI_PIPE_URL,
+                    headers={"Authorization": f"Bearer {TOKEN}"},
+                    json=payload,
+                    timeout=30.0,
+                )
+                if resp.status_code >= 400:
+                    print(f"HF_API_ERROR status={resp.status_code} body={resp.text[:500]}")
+                resp.raise_for_status()
+                res_data = resp.json()
+                raw_text = res_data["choices"][0]["message"]["content"]
+                return extract_json_object(raw_text)
 
-        print(f"AI_RAW_PARSED: {json.dumps(parsed)[:2000]}")
-        results_list = parsed.get("results", [])
-        by_id = {r.get("dossierId"): r for r in results_list if r.get("dossierId")}
-        return by_id
-    except Exception as e:
-        print(f"AI_BATCH_ERR: {e}")
-        return {}
+            try:
+                try:
+                    parsed = await attempt(use_json_mode=True)
+                except Exception as e1:
+                    print(f"AI_CHUNK_ATTEMPT1_FAILED: {e1}")
+                    parsed = await attempt(use_json_mode=False)
+                results_list = parsed.get("results", [])
+                return {r.get("dossierId"): r for r in results_list if r.get("dossierId")}
+            except Exception as e:
+                print(f"AI_CHUNK_ERR (size={len(chunk)}): {e}")
+                return {}
+
+    chunk_results = await asyncio.gather(*(run_chunk(c) for c in chunks))
+    merged: Dict[str, Dict[str, Any]] = {}
+    for cr in chunk_results:
+        merged.update(cr)
+    return merged
 
 
 # --- Endpoint ---
