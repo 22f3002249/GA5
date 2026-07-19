@@ -15,7 +15,7 @@ router = APIRouter()
 # it), or use ":fastest" / ":cheapest" to let HF pick automatically.
 AI_PIPE_URL = "https://router.huggingface.co/v1/chat/completions"
 TOKEN = os.environ.get("HF_TOKEN")
-MODEL = os.environ.get("HF_MODEL", "google/gemma-2-9b-it:cheapest")
+MODEL = os.environ.get("HF_MODEL", "google/gemma-2-2b-it:featherless-ai")
 # Set MOCK_AI=1 in the environment to test all plumbing (schema, digests,
 # idempotency, receipts) WITHOUT spending any API budget. Every dossier gets
 # a deterministic "no_action" proposal so you can verify the harness end to
@@ -230,6 +230,8 @@ async def call_ai_batch(dossiers: List[Dict[str, Any]], client: httpx.AsyncClien
             json=payload,
             timeout=90.0,
         )
+        if resp.status_code >= 400:
+            print(f"HF_API_ERROR status={resp.status_code} body={resp.text[:1000]}")
         resp.raise_for_status()
         res_data = resp.json()
         raw_text = res_data["choices"][0]["message"]["content"]
