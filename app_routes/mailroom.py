@@ -200,7 +200,7 @@ async def call_ai_batch(dossiers: List[Dict[str, Any]], client: httpx.AsyncClien
     if not dossiers:
         return {}
 
-    if MOCK_AI or not TOKEN:
+    if not TOKEN:
         return {
             d["dossierId"]: {
                 "action": "no_action",
