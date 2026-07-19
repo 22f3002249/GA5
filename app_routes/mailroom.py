@@ -20,7 +20,7 @@ MODEL = os.environ.get("HF_MODEL", "google/gemma-2-2b-it:featherless-ai")
 # idempotency, receipts) WITHOUT spending any API budget. Every dossier gets
 # a deterministic "no_action" proposal so you can verify the harness end to
 # end for $0 before pointing it at the real model.
-# MOCK_AI = os.environ.get("MOCK_AI", "0") == "1"
+MOCK_AI = os.environ.get("MOCK_AI", "0") == "1"
 PROFILE = "ga5-mailroom-action-gate/v2"
 
 STORAGE_FILE = "mailroom_state.json"
@@ -200,7 +200,7 @@ async def call_ai_batch(dossiers: List[Dict[str, Any]], client: httpx.AsyncClien
     if not dossiers:
         return {}
 
-    if not TOKEN:
+    if MOCK_AI or not TOKEN:
         return {
             d["dossierId"]: {
                 "action": "no_action",
@@ -212,11 +212,11 @@ async def call_ai_batch(dossiers: List[Dict[str, Any]], client: httpx.AsyncClien
         }
 
     user_content = json.dumps({"dossiers": dossiers})
+    combined_prompt = SYSTEM_PROMPT + "\n\n--- DOSSIERS TO TRIAGE ---\n" + user_content
     base_payload = {
         "model": MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": combined_prompt},
         ],
     }
 
