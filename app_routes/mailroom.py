@@ -129,12 +129,11 @@ async def process_chunk(chunk: list) -> dict:
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={GEMINI_API_KEY}"
         
-        # CRITICAL: Disable Google's safety filters so adversarial dossiers and prompt injections aren't blocked
         safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"}
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
         ]
         
         payload = {
@@ -147,20 +146,26 @@ async def process_chunk(chunk: list) -> dict:
         }
         
         async with httpx.AsyncClient() as client:
-            resp = await client.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=40.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                if "candidates" not in data or not data["candidates"]:
-                    print(f"[MAILROOM_LOG] Gemini blocked response due to safety: {data}")
-                    return {}
-                content = data["candidates"][0]["content"]["parts"][0]["text"]
-                content = content.replace("```json", "").replace("```", "").strip()
-                parsed = json.loads(content)
-                return {r["dossierId"]: r for r in parsed.get("results", []) if "dossierId" in r}
-            else:
-                print(f"[MAILROOM_LOG] Gemini HTTP Error {resp.status_code}: {resp.text}")
+            resp = await client.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=45.0)
+            
+            # Print the exact error if Google rejects it
+            if resp.status_code != 200:
+                print(f"[MAILROOM_FATAL] Google API returned status {resp.status_code}: {resp.text}")
+                return {}
+                
+            data = resp.json()
+            if "candidates" not in data or not data["candidates"]:
+                print(f"[MAILROOM_FATAL] Google blocked response entirely: {data}")
+                return {}
+                
+            content = data["candidates"][0]["content"]["parts"][0]["text"]
+            content = content.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(content)
+            return {r["dossierId"]: r for r in parsed.get("results", []) if "dossierId" in r}
+            
     except Exception as e:
-        print(f"[MAILROOM_LOG] Chunk Exception Error: {str(e)}")
+        import traceback
+        print(f"[MAILROOM_FATAL] Chunk Exception Traceback: {traceback.format_exc()}")
     return {}
 
 async def batch_process_ai(dossiers: list) -> dict:
