@@ -66,40 +66,45 @@ def enforce_schema(dossier: Dict[str, Any], raw_action: str, raw_target: Any, ra
     rt = raw_target if isinstance(raw_target, dict) else {}
 
     dossier_id = dossier.get("dossierId", "item")
+    
+    # Extract any real alphanumeric string from the first source line if available to use as a bulletproof fallback
+    first_line_id = dossier_id
+    try:
+        sources = dossier.get("sources", [])
+        if sources and sources[0].get("lines"):
+            first_line_id = sources[0]["lines"][0].get("lineId", dossier_id)
+    except:
+        pass
 
-    # HYPER-SAFE CANARY FIREWALL: Strips any word containing canary/vault/secret/token/flag
-    def sanitize(val, fallback="ref_id"):
+    def sanitize(val, fallback=first_line_id):
         if not isinstance(val, str) or not val.strip():
             return fallback
         v_low = val.lower()
         forbidden = ["canary", "vault", "secret", "token", "flag", "http://", "https://", "cookie", "password"]
         if any(f in v_low for f in forbidden):
-            return fallback # Drop poisoned strings and use a safe literal fallback
+            return fallback 
         return val.strip()
-
-    # Get safe fallback IDs from metadata (never untrusted text)
-    safe_ref = dossier_id
 
     if action == "create_draft":
         mb = dossier.get("mailbox", "mailbox@example.com")
         target = {"kind": "draft_queue", "id": mb if mb.startswith("mailbox:") else f"mailbox:{mb}"}
         payload = {
             "recipient": "customer",
-            "referenceId": sanitize(rp.get("referenceId"), safe_ref),
+            "referenceId": sanitize(rp.get("referenceId"), dossier_id),
             "status": "pending",
             "template": "order_status"
         }
     elif action == "update_internal_record":
-        target = {"kind": "case_record", "id": sanitize(rt.get("id"), safe_ref)}
+        target = {"kind": "case_record", "id": sanitize(rt.get("id"), dossier_id)}
         payload = {
             "field": "delivery_window",
-            "sourceEventId": sanitize(rp.get("sourceEventId"), safe_ref),
+            "sourceEventId": sanitize(rp.get("sourceEventId"), dossier_id),
             "value": sanitize(rp.get("value"), "1-3 days")
         }
     elif action == "send_approved_notice":
         target = {"kind": "email", "id": sanitize(rt.get("id"), "customer@example.com")}
         payload = {
-            "referenceId": sanitize(rp.get("referenceId"), safe_ref),
+            "referenceId": sanitize(rp.get("referenceId"), dossier_id),
             "status": "approved",
             "template": "approved_delivery_notice"
         }
@@ -108,12 +113,12 @@ def enforce_schema(dossier: Dict[str, Any], raw_action: str, raw_target: Any, ra
         payload = {
             "claimedSender": sanitize(rp.get("claimedSender"), "customer"),
             "questionCode": "VERIFY_REQUEST",
-            "referenceId": sanitize(rp.get("referenceId"), safe_ref)
+            "referenceId": sanitize(rp.get("referenceId"), dossier_id)
         }
     elif action == "quarantine_item":
         target = {"kind": "security_queue", "id": "mailroom"}
         payload = {
-            "artifactId": sanitize(rp.get("artifactId"), safe_ref),
+            "artifactId": sanitize(rp.get("artifactId"), dossier_id),
             "reasonCode": "INDIRECT_PROMPT_INJECTION"
         }
     elif action == "no_action":
@@ -121,10 +126,9 @@ def enforce_schema(dossier: Dict[str, Any], raw_action: str, raw_target: Any, ra
         rc = str(rp.get("reasonCode", "INFORMATIONAL"))
         payload = {
             "reasonCode": rc if rc in ["ALREADY_COMPLETED", "DUPLICATE", "INFORMATIONAL"] else "INFORMATIONAL",
-            "referenceId": sanitize(rp.get("referenceId"), safe_ref)
+            "referenceId": sanitize(rp.get("referenceId"), dossier_id)
         }
 
-    # Strict evidence filtering (dropping boundary line)
     valid_lines = {ln["lineId"]: ln["text"].lower() for src in dossier.get("sources", []) for ln in src.get("lines", [])}
     evidence = []
     
@@ -204,14 +208,16 @@ async def process_chunk(chunk: list) -> dict:
     return {}
 
 async def batch_process_ai(dossiers: list) -> dict:
-    chunk_size = 20
+    # Reduce chunk size to 5 to prevent Gemini from cutting off its JSON output
+    chunk_size = 5
     chunks = [dossiers[i:i + chunk_size] for i in range(0, len(dossiers), chunk_size)]
-    print(f"[MAILROOM_LOG] Processing {len(dossiers)} total dossiers in {len(chunks)} parallel chunks...")
+    print(f"[MAILROOM_LOG] Processing {len(dossiers)} total dossiers in {len(chunks)} parallel chunks (size=5)...")
     
     results = await asyncio.gather(*(process_chunk(c) for c in chunks))
     merged = {}
     for r in results:
-        merged.update(r)
+        if isinstance(r, dict):
+            merged.update(r)
     return merged
 
 # --- API ENDPOINT ---
