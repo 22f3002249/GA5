@@ -14,52 +14,65 @@ STATE_LOCK = asyncio.Lock()
 
 def load_db():
     if os.path.exists(STORAGE_FILE):
-        try: with open(STORAGE_FILE, "r") as f: return json.load(f)
-        except: pass
+        try:
+            with open(STORAGE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
     return {"tasks": {}, "idempotency": {}}
 
 _db = load_db()
 
 async def save_db():
     async with STATE_LOCK:
-        with open(STORAGE_FILE, "w") as f: json.dump(_db, f)
+        try:
+            with open(STORAGE_FILE, "w") as f:
+                json.dump(_db, f)
+        except Exception:
+            pass
 
 def A2AJSON(data: Any):
     return Response(content=json.dumps(data), media_type="application/a2a+json")
 
-# --- AI Engine (Optimized for speed) ---
-async def analyze_invoices_fast(packages: List[Dict]) -> List[Dict]:
+# --- AI Engine ---
+async def analyze_invoices(packages: List[Dict]) -> List[Dict]:
     try:
-        # Reduced timeout to force faster completion
-        async with httpx.AsyncClient(timeout=25.0) as client:
+        async with httpx.AsyncClient() as client:
             resp = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
                 json={
                     "model": MODEL,
-                    "messages": [{"role": "user", "content": f"Analyze invoices: {json.dumps(packages)}"}],
+                    "messages": [{"role": "user", "content": f"Analyze: {json.dumps(packages)}"}],
                     "response_format": {"type": "json_object"}
-                }
+                }, timeout=45.0
             )
             return json.loads(resp.json()['choices'][0]['message']['content']).get("proposals", [])
-    except:
-        return [{"packageId": p['packageId'], "actionId": f"f_{p['packageId']}", "action": "hold_invoice", "facts": {"vendorName": "NA", "invoiceNumber": "0", "amountMinor": 0, "currency": "INR"}, "evidenceRefs": [], "rationale": "Audit system delay."} for p in packages]
+    except Exception as e:
+        print(f"AI_ERR: {e}", file=sys.stderr)
+        return [{"packageId": p['packageId'], "actionId": f"f_{p['packageId']}", "action": "hold_invoice", "facts": {"vendorName": "NA", "invoiceNumber": "0", "amountMinor": 0, "currency": "INR"}, "evidenceRefs": [], "rationale": "System fallback."} for p in packages]
 
 # --- Routes ---
 @router.post("/message:send")
 async def message_send(request: Request, a2a_version: str = Header(None), authorization: str = Header(None)):
-    if a2a_version != "1.0" or not authorization: raise HTTPException(status_code=400)
+    if a2a_version != "1.0": raise HTTPException(status_code=400)
+    if not authorization or not authorization.startswith("Bearer "): raise HTTPException(status_code=401)
     
     body = await request.json()
     msg = body.get("message", {})
     msg_id = msg.get("messageId")
     
+    # Idempotency
+    principal = authorization.split(" ")[1]
+    idem_key = f"{principal}:{msg_id}"
+    if idem_key in _db["idempotency"]:
+        return A2AJSON({"task": _db["tasks"][_db["idempotency"][idem_key]]})
+
     media_type = msg.get("parts", [{}])[0].get("mediaType")
     data = msg.get("parts", [{}])[0].get("data")
 
     if media_type == "application/vnd.ga5.invoice-claim-batch+json":
-        # Process asynchronously to return quickly
-        proposals = await analyze_invoices_fast(data["packages"])
+        proposals = await analyze_invoices(data["packages"])
         task_id = f"t_{hashlib.md5(msg_id.encode()).hexdigest()[:12]}"
         
         task = {
@@ -67,6 +80,7 @@ async def message_send(request: Request, a2a_version: str = Header(None), author
             "history": [msg], "artifacts": [{"mediaType": "application/vnd.ga5.invoice-action-proposals+json", "data": {"batchId": data["batchId"], "proposals": proposals}}]
         }
         _db["tasks"][task_id] = task
+        _db["idempotency"][idem_key] = task_id
         await save_db()
         return A2AJSON({"task": task})
 
@@ -74,6 +88,7 @@ async def message_send(request: Request, a2a_version: str = Header(None), author
         task_id = msg.get("taskId")
         task = _db["tasks"].get(task_id)
         if not task: raise HTTPException(status_code=404)
+        
         task["state"] = "TASK_STATE_COMPLETED"
         task["history"].append(msg)
         task["artifacts"].append({"mediaType": "application/vnd.ga5.invoice-action-receipts+json", "data": data})
@@ -83,13 +98,13 @@ async def message_send(request: Request, a2a_version: str = Header(None), author
     raise HTTPException(status_code=400)
 
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: str, a2a_version: str = Header(None)):
-    if a2a_version != "1.0": raise HTTPException(400)
+async def get_task(task_id: str, a2a_version: str = Header(None), authorization: str = Header(None)):
+    if a2a_version != "1.0": raise HTTPException(status_code=400)
     task = _db["tasks"].get(task_id)
-    if not task: raise HTTPException(404)
+    if not task: raise HTTPException(status_code=404)
     return A2AJSON({"task": task})
 
 @router.get("/tasks")
-async def list_tasks(a2a_version: str = Header(None)):
-    if a2a_version != "1.0": raise HTTPException(400)
+async def list_tasks(a2a_version: str = Header(None), authorization: str = Header(None)):
+    if a2a_version != "1.0": raise HTTPException(status_code=400)
     return A2AJSON({"tasks": list(_db["tasks"].values())})
