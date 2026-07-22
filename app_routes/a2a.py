@@ -12,6 +12,14 @@ BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 STORAGE_FILE = "a2a_db.json"
 STATE_LOCK = asyncio.Lock()
 
+def check_headers(request: Request, a2a_version: str = Header(None)):
+    if a2a_version != "1.0":
+        raise HTTPException(status_code=400, detail="Missing or invalid A2A-Version header")
+    auth = request.headers.get("Authorization")
+    if not auth or not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    return auth.split(" ")[1]
+
 def load_db():
     if os.path.exists(STORAGE_FILE):
         try:
@@ -66,7 +74,7 @@ async def process_package(pkg: Dict) -> Dict:
 
 # --- Routes ---
 @router.post("/message:send")
-async def message_send(request: Request, a2a_version: str = Header(None), auth: str = Header(None)):
+async def message_send(request: Request, principal: str = Depends(check_headers)):
     if a2a_version != "1.0" or not auth or not auth.startswith("Bearer "): raise HTTPException(400)
     principal = auth.split(" ")[1]
     body = await request.json()
@@ -106,5 +114,9 @@ async def message_send(request: Request, a2a_version: str = Header(None), auth: 
         task["artifacts"].append({"mediaType": "application/vnd.ga5.invoice-action-receipts+json", "data": msg["parts"][0]["data"]})
         await save_db()
         return A2AJSON({"task": task})
+        
+@router.post("/message%3Asend")
+async def message_send_encoded(request: Request, principal: str = Depends(check_headers)):
+    return await message_send(request, principal)
     
     raise HTTPException(400)
