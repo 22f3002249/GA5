@@ -5,7 +5,7 @@ import json
 import httpx
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL") # default fallback model
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL")
 
 def get_canonical_json(obj):
     return json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
@@ -14,12 +14,18 @@ def compute_dossier_hash(dossier: dict) -> str:
     canonical = get_canonical_json(dossier)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
+def safe_get_line_id(line_obj, fallback_lines):
+    if line_obj and "lineId" in line_obj:
+        return line_obj["lineId"]
+    if fallback_lines:
+        return fallback_lines[0]["lineId"]
+    return "unknown_line"
+
 def run_deterministic_fallback(dossier: dict, call_id: str, all_lines: list) -> dict:
     dossier_id = dossier["dossierId"]
     mailbox = dossier.get("mailbox", "")
     
     rule_line = None
-    operative_line = None
     
     # 1. Prompt Injection (quarantine_item)
     injection_line = None
@@ -47,12 +53,18 @@ def run_deterministic_fallback(dossier: dict, call_id: str, all_lines: list) -> 
         if not artifact_line:
             artifact_line = injection_line
             
-        artifact_id = artifact_line["sourceId"]
-        match = re.search(r"artifact-?([A-Za-z0-9_-]+)", artifact_line["text"])
-        if match:
-            artifact_id = match.group(0)
+        artifact_id = artifact_line.get("sourceId", "unknown") if artifact_line else "unknown"
+        if artifact_line:
+            match = re.search(r"artifact-?([A-Za-z0-9_-]+)", artifact_line["text"])
+            if match:
+                artifact_id = match.group(0)
             
-        evidence = list(set([rule_line["lineId"], injection_line["lineId"], exfil_line["lineId"] if exfil_line else injection_line["lineId"], artifact_line["lineId"]]))
+        evidence = list(set([
+            safe_get_line_id(rule_line, all_lines),
+            safe_get_line_id(injection_line, all_lines),
+            safe_get_line_id(exfil_line, all_lines) if exfil_line else safe_get_line_id(injection_line, all_lines),
+            safe_get_line_id(artifact_line, all_lines)
+        ]))
         return {
             "dossierId": dossier_id,
             "callId": call_id,
@@ -77,7 +89,7 @@ def run_deterministic_fallback(dossier: dict, call_id: str, all_lines: list) -> 
                 
     if is_no_action:
         for line in all_lines:
-            if "record" in line["text"].lower() and line["lineId"] != rule_line["lineId"] and line["lineId"] != follow_up_line["lineId"]:
+            if "record" in line["text"].lower() and line["lineId"] != safe_get_line_id(rule_line, []) and line["lineId"] != safe_get_line_id(follow_up_line, []):
                 record_line = line
                 break
         if not record_line:
@@ -97,7 +109,11 @@ def run_deterministic_fallback(dossier: dict, call_id: str, all_lines: list) -> 
         elif "duplicate" in full_text:
             reason_code = "DUPLICATE"
             
-        evidence = list(set([rule_line["lineId"], record_line["lineId"], follow_up_line["lineId"]]))
+        evidence = list(set([
+            safe_get_line_id(rule_line, all_lines),
+            safe_get_line_id(record_line, all_lines),
+            safe_get_line_id(follow_up_line, all_lines)
+        ]))
         return {
             "dossierId": dossier_id,
             "callId": call_id,
@@ -117,7 +133,7 @@ def run_deterministic_fallback(dossier: dict, call_id: str, all_lines: list) -> 
             
     if approval_permit_line:
         for line in all_lines:
-            if "@" in line["text"] and line["lineId"] != approval_permit_line["lineId"]:
+            if "@" in line["text"] and line["lineId"] != safe_get_line_id(approval_permit_line, []):
                 approval_scope_line = line
                 break
         if not approval_scope_line:
@@ -145,7 +161,10 @@ def run_deterministic_fallback(dossier: dict, call_id: str, all_lines: list) -> 
                     status = m.group(1)
                     break
                     
-        evidence = list(set([approval_permit_line["lineId"], approval_scope_line["lineId"]]))
+        evidence = list(set([
+            safe_get_line_id(approval_permit_line, all_lines),
+            safe_get_line_id(approval_scope_line, all_lines)
+        ]))
         return {
             "dossierId": dossier_id,
             "callId": call_id,
@@ -189,7 +208,10 @@ def run_deterministic_fallback(dossier: dict, call_id: str, all_lines: list) -> 
                 if m:
                     source_event_id = m.group(0)
                     
-        evidence = list(set([rule_line["lineId"] if rule_line else event_auth_line["lineId"], event_auth_line["lineId"]]))
+        evidence = list(set([
+            safe_get_line_id(rule_line, all_lines) if rule_line else safe_get_line_id(event_auth_line, all_lines),
+            safe_get_line_id(event_auth_line, all_lines)
+        ]))
         return {
             "dossierId": dossier_id,
             "callId": call_id,
@@ -237,7 +259,11 @@ def run_deterministic_fallback(dossier: dict, call_id: str, all_lines: list) -> 
                     owning_team = m.group(1)
                     break
                     
-        evidence = list(set([rule_line["lineId"] if rule_line else mismatch_line["lineId"], mismatch_line["lineId"], iam_line["lineId"]]))
+        evidence = list(set([
+            safe_get_line_id(rule_line, all_lines) if rule_line else safe_get_line_id(mismatch_line, all_lines),
+            safe_get_line_id(mismatch_line, all_lines),
+            safe_get_line_id(iam_line, all_lines)
+        ]))
         return {
             "dossierId": dossier_id,
             "callId": call_id,
@@ -264,7 +290,7 @@ def run_deterministic_fallback(dossier: dict, call_id: str, all_lines: list) -> 
                     rule_line = line
                     break
         for line in all_lines:
-            if "order" in line["text"].lower() and line["lineId"] != rule_line["lineId"] and line["lineId"] != request_line["lineId"]:
+            if "order" in line["text"].lower() and line["lineId"] != safe_get_line_id(rule_line, []) and line["lineId"] != safe_get_line_id(request_line, []):
                 order_record_line = line
                 break
         if not order_record_line:
@@ -292,7 +318,11 @@ def run_deterministic_fallback(dossier: dict, call_id: str, all_lines: list) -> 
                     status = m.group(1)
                     break
                     
-        evidence = list(set([rule_line["lineId"] if rule_line else request_line["lineId"], order_record_line["lineId"], request_line["lineId"]]))
+        evidence = list(set([
+            safe_get_line_id(rule_line, all_lines) if rule_line else safe_get_line_id(request_line, all_lines),
+            safe_get_line_id(order_record_line, all_lines),
+            safe_get_line_id(request_line, all_lines)
+        ]))
         return {
             "dossierId": dossier_id,
             "callId": call_id,
@@ -325,11 +355,9 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
                 "sourceId": source_id
             })
 
-    # If OpenRouter API key is not configured, directly run deterministic fallback
     if not OPENROUTER_API_KEY:
         return run_deterministic_fallback(dossier, call_id, all_lines)
 
-    # Prepare data for LLM analysis
     dossier_text_view = []
     for line in all_lines:
         dossier_text_view.append(f"LineID: {line['lineId']} | SourceID: {line['sourceId']} | Text: {line['text']}")
@@ -379,7 +407,6 @@ Return a valid JSON object matching this structure exactly (do not output any co
 """
 
     try:
-        # Call OpenRouter API synchronously using httpx
         with httpx.Client(timeout=15.0) as client:
             headers = {
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -397,18 +424,14 @@ Return a valid JSON object matching this structure exactly (do not output any co
             if response.status_code == 200:
                 resp_json = response.json()
                 content = resp_json["choices"][0]["message"]["content"].strip()
-                # Parse JSON
                 result = json.loads(content)
                 
-                # Basic validation checks
                 action = result.get("action")
                 evidence = result.get("evidence", [])
                 
-                # Check if evidence matches valid line IDs from dossier
                 valid_line_ids = {l["lineId"] for l in all_lines}
                 filtered_evidence = [e for e in evidence if e in valid_line_ids]
                 
-                # If valid action and has evidence, return proposal
                 if action and len(filtered_evidence) > 0:
                     return {
                         "dossierId": dossier_id,
@@ -421,5 +444,4 @@ Return a valid JSON object matching this structure exactly (do not output any co
     except Exception as e:
         print("OpenRouter call failed or returned invalid JSON:", e)
 
-    # Graceful fallback to deterministic analysis if LLM fails or is invalid
     return run_deterministic_fallback(dossier, call_id, all_lines)
