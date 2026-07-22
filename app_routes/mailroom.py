@@ -57,16 +57,19 @@ def compute_proposal_digest(proposal: dict) -> str:
     canonical = get_canonical_json(obj)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
+import traceback
+
 @router.post("/mailroom")
+@router.post("/")
 async def handle_mailroom(request: Request):
     try:
         body_bytes = await request.body()
         if len(body_bytes) > 512 * 1024:
-            raise HTTPException(status_code=400, detail="Request body exceeds 512 KiB")
+            return JSONResponse(status_code=400, content={"error": "Request body exceeds 512 KiB"})
             
         req_json = json.loads(body_bytes.decode("utf-8"))
     except Exception as e:
-        return JSONResponse(status_code=400, content={"error": "Invalid JSON format"})
+        return JSONResponse(status_code=400, content={"error": f"Invalid JSON format: {str(e)}"})
 
     # Validate profile
     profile = req_json.get("profile")
@@ -74,12 +77,24 @@ async def handle_mailroom(request: Request):
         return JSONResponse(status_code=400, content={"error": "Unsupported profile"})
 
     operation = req_json.get("operation")
-    if operation == "propose":
-        return await handle_propose(req_json)
-    elif operation == "commit":
-        return await handle_commit(req_json)
-    else:
-        return JSONResponse(status_code=400, content={"error": "Unknown operation"})
+    try:
+        if operation == "propose":
+            return await handle_propose(req_json)
+        elif operation == "commit":
+            return await handle_commit(req_json)
+        else:
+            return JSONResponse(status_code=400, content={"error": "Unknown operation"})
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("Internal Error during processing:\n", tb)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Internal Server Error",
+                "detail": str(e),
+                "traceback": tb
+            }
+        )
 
 async def handle_propose(req_json: dict):
     evaluation_id = req_json.get("evaluationId")
