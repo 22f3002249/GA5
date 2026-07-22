@@ -12,7 +12,7 @@ from app_routes import skillscan
 from app_routes import redteam_guardrail
 from app_routes import mcp_server
 from app_routes import mailroom
-# from app_routes import a2a
+from app_routes import a2a
 
 app = FastAPI(title="exam-endpoints")
 
@@ -37,12 +37,17 @@ app.include_router(mcp_server.router)
 # --- Q9: Mailroom ---
 app.include_router(mailroom.router)
 
-# --- Q10: A2A ---
-# @app.get("/.well-known/agent-card.json")
-# async def root_card():
-#     # Standard JSON is fine for the card, but A2AResponse is safer
-#     return await a2a.get_card_data()
-# app.include_router(a2a.router, prefix="/a2a")
+--- Q10: A2A ---
+@app.get("/.well-known/agent-card.json")
+async def agent_card():
+    return {
+        "name": "Audit Agent",
+        "version": "1.0.0",
+        "supportedInterfaces": [{"protocolBinding": "HTTP+JSON", "protocolVersion": "1.0", "endpoint": os.environ.get("BASE_URL")}],
+        "defaultInputModes": ["application/vnd.ga5.invoice-claim-batch+json"],
+        "defaultOutputModes": ["application/vnd.ga5.invoice-action-proposals+json", "application/vnd.ga5.invoice-action-receipts+json"]
+    }
+app.include_router(a2a.router, prefix="/a2a")
 
 # Q11 will be added here as we build them ---
 #
