@@ -125,23 +125,40 @@ async def process_chunk(chunk: list) -> dict:
         return {}
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={GEMINI_API_KEY}"
+        
+        # CRITICAL: Disable Google's safety filters so adversarial dossiers and prompt injections aren't blocked
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"}
+        ]
+        
         payload = {
             "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
             "contents": [{
                 "parts": [{"text": json.dumps({"dossiers": [{"dossierId": d["dossierId"], "mailbox": d.get("mailbox"), "objective": d.get("objective"), "sources": d.get("sources")} for d in chunk]})}]
             }],
-            "generationConfig": {"responseMimeType": "application/json"}
+            "generationConfig": {"responseMimeType": "application/json"},
+            "safetySettings": safety_settings
         }
+        
         async with httpx.AsyncClient() as client:
-            resp = await client.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=35.0)
+            resp = await client.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=40.0)
             if resp.status_code == 200:
                 data = resp.json()
+                if "candidates" not in data or not data["candidates"]:
+                    print(f"[MAILROOM_LOG] Gemini blocked response due to safety: {data}")
+                    return {}
                 content = data["candidates"][0]["content"]["parts"][0]["text"]
                 content = content.replace("```json", "").replace("```", "").strip()
                 parsed = json.loads(content)
                 return {r["dossierId"]: r for r in parsed.get("results", []) if "dossierId" in r}
+            else:
+                print(f"[MAILROOM_LOG] Gemini HTTP Error {resp.status_code}: {resp.text}")
     except Exception as e:
-        print(f"[MAILROOM_LOG] Chunk Error: {e}")
+        print(f"[MAILROOM_LOG] Chunk Exception Error: {str(e)}")
     return {}
 
 async def batch_process_ai(dossiers: list) -> dict:
