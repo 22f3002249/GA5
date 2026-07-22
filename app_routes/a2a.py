@@ -1,12 +1,13 @@
 import hashlib, json, os, httpx, asyncio, sys
 from typing import Any, Dict, List
-from fastapi import APIRouter, Request, Response, HTTPException
+from fastapi import APIRouter, Request, Response, HTTPException, Header, Depends
 
 router = APIRouter()
 
 # --- Config ---
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 MODEL = os.environ.get("OPENROUTER_MODEL")
+BASE_URL = os.environ.get("BASE_URL", "https://ga5-1.onrender.com/a2a").rstrip("/")
 
 STORAGE_FILE = "a2a_db.json"
 STATE_LOCK = asyncio.Lock()
@@ -43,9 +44,6 @@ async def analyze_invoices(packages: List[Dict]) -> List[Dict]:
                     "response_format": {"type": "json_object"}
                 }, timeout=45.0
             )
-            # Log raw response for debugging in Render logs if AI fails
-            if resp.status_code != 200:
-                print(f"AI_DEBUG_ERROR: {resp.text}", file=sys.stderr)
             return json.loads(resp.json()['choices'][0]['message']['content']).get("proposals", [])
     except Exception as e:
         print(f"AI_ERR: {e}", file=sys.stderr)
@@ -53,22 +51,16 @@ async def analyze_invoices(packages: List[Dict]) -> List[Dict]:
 
 # --- Routes ---
 @router.post("/message:send")
-async def message_send(request: Request):
-    # 1. Header Validation (FastAPI lowercase headers: 'authorization', 'a2a-version')
-    headers = request.headers
-    if headers.get("a2a-version") != "1.0":
-        raise HTTPException(status_code=400, detail="Invalid A2A-Version")
+async def message_send(request: Request, a2a_version: str = Header(None), authorization: str = Header(None)):
+    # 1. Protocol Checks
+    if a2a_version != "1.0": raise HTTPException(status_code=400)
+    if not authorization or not authorization.startswith("Bearer "): raise HTTPException(status_code=401)
+    principal = authorization.split(" ")[1]
     
-    auth = headers.get("authorization")
-    if not auth or not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    
-    principal = auth.split(" ")[1]
     body = await request.json()
     msg = body.get("message", {})
     msg_id = msg.get("messageId")
     
-    # 2. Idempotency
     idem_key = f"{principal}:{msg_id}"
     if idem_key in _db["idempotency"]:
         return A2AJSON({"task": _db["tasks"][_db["idempotency"][idem_key]]})
@@ -80,10 +72,8 @@ async def message_send(request: Request):
         proposals = await analyze_invoices(data["packages"])
         task_id = f"t_{hashlib.md5(msg_id.encode()).hexdigest()[:12]}"
         task = {
-            "taskId": task_id, "contextId": f"ctx_{task_id}",
-            "state": "TASK_STATE_INPUT_REQUIRED",
-            "history": [msg],
-            "artifacts": [{"mediaType": "application/vnd.ga5.invoice-action-proposals+json", "data": {"batchId": data["batchId"], "proposals": proposals}}]
+            "taskId": task_id, "state": "TASK_STATE_INPUT_REQUIRED",
+            "history": [msg], "artifacts": [{"mediaType": "application/vnd.ga5.invoice-action-proposals+json", "data": {"batchId": data["batchId"], "proposals": proposals}}]
         }
         _db["tasks"][task_id] = task
         _db["idempotency"][idem_key] = task_id
@@ -94,7 +84,6 @@ async def message_send(request: Request):
         task_id = msg.get("taskId")
         task = _db["tasks"].get(task_id)
         if not task: raise HTTPException(status_code=404)
-        
         task["state"] = "TASK_STATE_COMPLETED"
         task["history"].append(msg)
         task["artifacts"].append({"mediaType": "application/vnd.ga5.invoice-action-receipts+json", "data": data})
@@ -104,13 +93,13 @@ async def message_send(request: Request):
     raise HTTPException(status_code=400)
 
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: str, auth: str = Header(None)):
-    if not auth: raise HTTPException(status_code=401)
+async def get_task(task_id: str, a2a_version: str = Header(None), authorization: str = Header(None)):
+    if a2a_version != "1.0" or not authorization: raise HTTPException(status_code=400)
     task = _db["tasks"].get(task_id)
     if not task: raise HTTPException(status_code=404)
     return A2AJSON({"task": task})
 
 @router.get("/tasks")
-async def list_tasks(auth: str = Header(None)):
-    if not auth: raise HTTPException(status_code=401)
+async def list_tasks(a2a_version: str = Header(None), authorization: str = Header(None)):
+    if a2a_version != "1.0" or not authorization: raise HTTPException(status_code=400)
     return A2AJSON({"tasks": list(_db["tasks"].values())})
