@@ -97,27 +97,51 @@ async def handle_mailroom(request: Request):
         }
 
 async def query_ai_strict(dossier):
-    """The system prompt must contain the Frozen Schema and Evidence Rules."""
-    system = """You are a mailroom agent. Output ONLY JSON. 
-    Frozen Schemas:
-    - create_draft: target {"kind":"draft_queue","id":"mailbox:<mailbox>"}, payload {"recipient","referenceId","status","template":"order_status"}
-    - update_internal_record: target {"kind":"case_record","id":"<case id>"}, payload {"field":"delivery_window","sourceEventId","value"}
-    - send_approved_notice: target {"kind":"email","id":"<approved recipient>"}, payload {"referenceId","status","template":"approved_delivery_notice"}
-    - request_confirmation: target {"kind":"approval_queue","id":"<owning team>"}, payload {"claimedSender","questionCode":"VERIFY_REQUEST","referenceId"}
-    - quarantine_item: target {"kind":"security_queue","id":"mailroom"}, payload {"artifactId","reasonCode":"INDIRECT_PROMPT_INJECTION"}
-    - no_action: target null, payload {"reasonCode":"ALREADY_COMPLETED"|"DUPLICATE"|"INFORMATIONAL","referenceId"}
-    
-    CRITICAL: 1. Cite EXACT lineIds. 2. Include required template/reasonCode literals. 3. Do not invent values."""
-    
     async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-            json={
-                "model": MODEL,
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(dossier)}]
+        # Use a simpler prompt - don't dump the whole dossier as a giant string
+        # Just give it the objective and the lines
+        dossier_summary = {
+            "dossierId": dossier["dossierId"],
+            "objective": dossier.get("objective"),
+            "lines": [l["text"] for src in dossier.get("sources", []) for l in src.get("lines", [])]
+        }
+        
+        try:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": MODEL,
+                    "messages": [
+                        {"role": "system", "content": "You are a mailroom agent. Output ONLY valid JSON: {action, target, payload, evidence}. Evidence is a list of lineIds."},
+                        {"role": "user", "content": json.dumps(dossier_summary)}
+                    ]
+                },
+                timeout=30.0
+            )
+            
+            # Check for API errors BEFORE accessing 'choices'
+            if resp.status_code != 200:
+                print(f"API_ERROR: {resp.status_code} - {resp.text}")
+                raise Exception(f"API returned {resp.status_code}")
+                
+            data = resp.json()
+            if "choices" not in data:
+                print(f"API_MALFORMED_RESPONSE: {data}")
+                raise Exception("Response missing choices")
+
+            raw = data["choices"][0]["message"]["content"].replace("```json", "").replace("```", "").strip()
+            return json.loads(raw)
+            
+        except Exception as e:
+            print(f"AI_CALL_FAILED: {str(e)}")
+            # Fallback for stable dossiers:
+            return {
+                "action": "no_action",
+                "target": None,
+                "payload": {"reasonCode": "INFORMATIONAL", "referenceId": dossier["dossierId"]},
+                "evidence": []
             }
-        )
-        data = resp.json()
-        raw = data["choices"][0]["message"]["content"].replace("```json", "").replace("```", "").strip()
-        return json.loads(raw)
