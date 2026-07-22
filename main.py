@@ -41,11 +41,12 @@ app.include_router(mailroom.router)
 # --- Q10: A2A ---
 @app.get("/.well-known/agent-card.json")
 async def root_agent_card():
-    # Return raw JSON without external calls
+    base_url = os.environ.get("BASE_URL", "https://ga5-1.onrender.com/a2a").rstrip("/")
     return {
         "name": "Audit Agent",
         "version": "1.0.0",
-        "supportedInterfaces": [{"protocolBinding": "HTTP+JSON", "protocolVersion": "1.0", "endpoint": "https://ga5-1.onrender.com/a2a"}],
+        "capabilities": {"invoice_action_agent": {}},
+        "supportedInterfaces": [{"protocolBinding": "HTTP+JSON", "protocolVersion": "1.0", "endpoint": base_url}],
         "defaultInputModes": ["application/vnd.ga5.invoice-claim-batch+json"],
         "defaultOutputModes": ["application/vnd.ga5.invoice-action-proposals+json", "application/vnd.ga5.invoice-action-receipts+json"]
     }
