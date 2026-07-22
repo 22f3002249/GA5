@@ -2,6 +2,7 @@ import os
 import re
 import base64
 import shlex
+import urllib.parse
 from urllib.parse import urlparse
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -117,11 +118,26 @@ def check_bash(command: str) -> Decision:
 
 
 def check_write_file(path: str) -> Decision:
-    resolved = norm_path(path, base=WRITE_ROOT)
+    # Check both the raw path AND its percent-decoded form. A classic bypass
+    # is encoding ".." as "%2e%2e" or "/" as "%2f" - if decoding reveals an
+    # escape, treat it as an escape regardless of how the raw string looked.
+    candidates = [path]
+    try:
+        decoded = urllib.parse.unquote(path)
+        if decoded != path:
+            candidates.append(decoded)
+    except Exception:
+        pass
+
     allowed_root = os.path.normpath(WRITE_ROOT)
-    if resolved == allowed_root or resolved.startswith(allowed_root + os.sep):
-        return Decision(decision="allow", reason="Write target is inside the allowed /srv/reports directory.")
-    return Decision(decision="block", reason="Write target is outside the allowed /srv/reports directory.")
+    for c in candidates:
+        resolved = norm_path(c, base=WRITE_ROOT)
+        if not (resolved == allowed_root or resolved.startswith(allowed_root + os.sep)):
+            return Decision(
+                decision="block",
+                reason=f"Write target resolves outside the allowed /srv/reports directory (checked raw and decoded forms)."
+            )
+    return Decision(decision="allow", reason="Write target is inside the allowed /srv/reports directory.")
 
 
 def check_http_request(url: str) -> Decision:
@@ -140,9 +156,14 @@ def check_http_request(url: str) -> Decision:
 @router.post("/guardrail", response_model=Decision)
 def guardrail(call: ToolCall):
     if call.tool == "bash":
-        return check_bash(call.command or "")
+        result = check_bash(call.command or "")
     elif call.tool == "write_file":
-        return check_write_file(call.path or "")
+        result = check_write_file(call.path or "")
     elif call.tool == "http_request":
-        return check_http_request(call.url or "")
-    return Decision(decision="block", reason="Unknown tool.")
+        result = check_http_request(call.url or "")
+    else:
+        result = Decision(decision="block", reason="Unknown tool.")
+
+    print(f"GUARDRAIL_CHECK tool={call.tool} command={call.command!r} path={call.path!r} "
+          f"url={call.url!r} -> decision={result.decision} reason={result.reason}")
+    return result
