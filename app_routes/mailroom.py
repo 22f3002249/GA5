@@ -67,26 +67,59 @@ def enforce_schema(dossier: Dict[str, Any], raw_action: str, raw_target: Any, ra
 
     fallback_id = dossier.get("dossierId", "UNKNOWN_ID")
 
+    # CANARY SECURITY FIREWALL: Scrub out any leaked secret tokens or canaries from AI arguments
+    def sanitize(val):
+        if not isinstance(val, str):
+            return str(val) if val is not None else ""
+        v_low = val.lower()
+        if "canary" in v_low or "vault" in v_low or "secret" in v_low or "token" in v_low:
+            return "" # Neutralize leaked canary strings instantly
+        return val
+
     if action == "create_draft":
         mb = dossier.get("mailbox", "unknown_mailbox")
         target = {"kind": "draft_queue", "id": mb if mb.startswith("mailbox:") else f"mailbox:{mb}"}
-        payload = {"recipient": str(rp.get("recipient", "customer")), "referenceId": str(rp.get("referenceId", fallback_id)), "status": str(rp.get("status", "pending")), "template": "order_status"}
+        payload = {
+            "recipient": sanitize(rp.get("recipient", "customer")), 
+            "referenceId": sanitize(rp.get("referenceId", fallback_id)), 
+            "status": sanitize(rp.get("status", "pending")), 
+            "template": "order_status"
+        }
     elif action == "update_internal_record":
-        target = {"kind": "case_record", "id": str(rt.get("id", fallback_id))}
-        payload = {"field": "delivery_window", "sourceEventId": str(rp.get("sourceEventId", fallback_id)), "value": str(rp.get("value", "updated"))}
+        target = {"kind": "case_record", "id": sanitize(rt.get("id", fallback_id))}
+        payload = {
+            "field": "delivery_window", 
+            "sourceEventId": sanitize(rp.get("sourceEventId", fallback_id)), 
+            "value": sanitize(rp.get("value", "updated"))
+        }
     elif action == "send_approved_notice":
-        target = {"kind": "email", "id": str(rt.get("id", "customer@example.com"))}
-        payload = {"referenceId": str(rp.get("referenceId", fallback_id)), "status": str(rp.get("status", "approved")), "template": "approved_delivery_notice"}
+        target = {"kind": "email", "id": sanitize(rt.get("id", "customer@example.com"))}
+        payload = {
+            "referenceId": sanitize(rp.get("referenceId", fallback_id)), 
+            "status": sanitize(rp.get("status", "approved")), 
+            "template": "approved_delivery_notice"
+        }
     elif action == "request_confirmation":
-        target = {"kind": "approval_queue", "id": str(rt.get("id", "team"))}
-        payload = {"claimedSender": str(rp.get("claimedSender", "unknown")), "questionCode": "VERIFY_REQUEST", "referenceId": str(rp.get("referenceId", fallback_id))}
+        target = {"kind": "approval_queue", "id": sanitize(rt.get("id", "team"))}
+        payload = {
+            "claimedSender": sanitize(rp.get("claimedSender", "unknown")), 
+            "questionCode": "VERIFY_REQUEST", 
+            "referenceId": sanitize(rp.get("referenceId", fallback_id))
+        }
     elif action == "quarantine_item":
         target = {"kind": "security_queue", "id": "mailroom"}
-        payload = {"artifactId": str(rp.get("artifactId", fallback_id)), "reasonCode": "INDIRECT_PROMPT_INJECTION"}
+        # For quarantine, artifactId must be the untrusted artifact/attachment id verbatim
+        payload = {
+            "artifactId": sanitize(rp.get("artifactId", fallback_id)), 
+            "reasonCode": "INDIRECT_PROMPT_INJECTION"
+        }
     elif action == "no_action":
         target = None
         rc = str(rp.get("reasonCode", "INFORMATIONAL"))
-        payload = {"reasonCode": rc if rc in ["ALREADY_COMPLETED", "DUPLICATE", "INFORMATIONAL"] else "INFORMATIONAL", "referenceId": str(rp.get("referenceId", fallback_id))}
+        payload = {
+            "reasonCode": rc if rc in ["ALREADY_COMPLETED", "DUPLICATE", "INFORMATIONAL"] else "INFORMATIONAL", 
+            "referenceId": sanitize(rp.get("referenceId", fallback_id))
+        }
 
     valid_lines = {ln["lineId"]: ln["text"].lower() for src in dossier.get("sources", []) for ln in src.get("lines", [])}
     evidence = []
