@@ -37,7 +37,7 @@ app.include_router(mcp_server.router)
 # --- Q9: Mailroom ---
 app.include_router(mailroom.router)
 
---- Q10: A2A ---
+# --- Q10: A2A ---
 @app.get("/.well-known/agent-card.json")
 async def agent_card():
     return {
