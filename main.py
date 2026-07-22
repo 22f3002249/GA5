@@ -13,6 +13,7 @@ from app_routes import redteam_guardrail
 from app_routes import mcp_server
 from app_routes import mailroom
 from app_routes import a2a
+import os
 
 app = FastAPI(title="exam-endpoints")
 
@@ -45,10 +46,6 @@ async def root_agent_card():
 
 # Logic mounted here
 app.include_router(a2a.router, prefix="/a2a")
-
-@app.get("/")
-def health():
-    return {"status": "ok"}
 
 # Q11 will be added here as we build them ---
 #
