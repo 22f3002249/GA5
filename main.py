@@ -4,7 +4,7 @@ Each question lives in its own module under app_routes/ and gets mounted
 here under its own path prefix. This file only wires things together.
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from app_routes import proration
 from app_routes import guardrail
 from app_routes import runcontrol
@@ -13,7 +13,7 @@ from app_routes import redteam_guardrail
 from app_routes import mcp_server
 from app_routes import mailroom
 from app_routes import a2a
-import os
+import os, json
 
 app = FastAPI(title="exam-endpoints")
 
@@ -41,8 +41,14 @@ app.include_router(mailroom.router)
 # --- Q10: A2A ---
 @app.get("/.well-known/agent-card.json")
 async def root_agent_card():
-    # Call the helper directly
-    return await a2a.get_card_data()
+    # Return raw JSON without external calls
+    return {
+        "name": "Audit Agent",
+        "version": "1.0.0",
+        "supportedInterfaces": [{"protocolBinding": "HTTP+JSON", "protocolVersion": "1.0", "endpoint": "https://ga5-1.onrender.com/a2a"}],
+        "defaultInputModes": ["application/vnd.ga5.invoice-claim-batch+json"],
+        "defaultOutputModes": ["application/vnd.ga5.invoice-action-proposals+json", "application/vnd.ga5.invoice-action-receipts+json"]
+    }
 
 # Logic mounted here
 app.include_router(a2a.router, prefix="/a2a")
