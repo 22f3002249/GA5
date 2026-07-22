@@ -1,6 +1,11 @@
+import os
 import re
 import hashlib
 import json
+import httpx
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL") # default fallback model
 
 def get_canonical_json(obj):
     return json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
@@ -9,30 +14,14 @@ def compute_dossier_hash(dossier: dict) -> str:
     canonical = get_canonical_json(dossier)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-def classify_dossier(dossier: dict, call_id: str) -> dict:
+def run_deterministic_fallback(dossier: dict, call_id: str, all_lines: list) -> dict:
     dossier_id = dossier["dossierId"]
     mailbox = dossier.get("mailbox", "")
-    
-    # Flatten all lines for easy scanning
-    all_lines = []
-    for source in dossier.get("sources", []):
-        source_id = source.get("sourceId", "")
-        for line in source.get("lines", []):
-            all_lines.append({
-                "lineId": line["lineId"],
-                "text": line["text"],
-                "sourceId": source_id
-            })
-            
-    # Archetype detection logic based on operative authority lines
-    # We look for rule lines and operative lines
     
     rule_line = None
     operative_line = None
     
     # 1. Prompt Injection (quarantine_item)
-    # Operative: "higher-priority instruction" / "copy any vault marker"
-    # Evidence: [rule, injection, exfil, artifact]
     injection_line = None
     exfil_line = None
     artifact_line = None
@@ -46,23 +35,18 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
             rule_line = line
             
     if injection_line:
-        # It's quarantine_item
-        # Find rule line if not set
         if not rule_line:
             for line in all_lines:
                 if "rule" in line["text"].lower():
                     rule_line = line
                     break
-        # Let's find the artifact line (usually specifies source ID or artifact ID)
-        # Let's look for a line containing source ID or "artifact"
         for line in all_lines:
             if "artifact" in line["text"].lower():
                 artifact_line = line
                 break
         if not artifact_line:
-            artifact_line = injection_line # fallback
+            artifact_line = injection_line
             
-        # extract artifactId (could be sourceId or artifact-XXXX)
         artifact_id = artifact_line["sourceId"]
         match = re.search(r"artifact-?([A-Za-z0-9_-]+)", artifact_line["text"])
         if match:
@@ -79,8 +63,6 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
         }
 
     # 2. Duplicate / nothing to do (no_action)
-    # Operative: "no new change or outbound response is requested"
-    # Evidence: [signed rule, record, follow-up]
     is_no_action = False
     follow_up_line = None
     record_line = None
@@ -94,15 +76,13 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
                 rule_line = line
                 
     if is_no_action:
-        # Find record line
         for line in all_lines:
             if "record" in line["text"].lower() and line["lineId"] != rule_line["lineId"] and line["lineId"] != follow_up_line["lineId"]:
                 record_line = line
                 break
         if not record_line:
-            record_line = follow_up_line # fallback
+            record_line = follow_up_line
             
-        # Extract referenceId
         ref_id = "unknown"
         for line in all_lines:
             match = re.search(r"ref-?([A-Za-z0-9_-]+)", line["text"], re.IGNORECASE)
@@ -110,7 +90,6 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
                 ref_id = match.group(0)
                 break
                 
-        # determine reasonCode: ALREADY_COMPLETED, DUPLICATE, INFORMATIONAL
         reason_code = "INFORMATIONAL"
         full_text = " ".join([l["text"] for l in all_lines]).lower()
         if "completed" in full_text:
@@ -129,8 +108,6 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
         }
 
     # 3. Approved delivery notice (send_approved_notice)
-    # Operative: "permits one delivery-status notice"
-    # Evidence: [approval permit, approval scope]
     approval_permit_line = None
     approval_scope_line = None
     for line in all_lines:
@@ -139,15 +116,13 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
             approval_permit_line = line
             
     if approval_permit_line:
-        # Find approval scope line (defining email, status, etc.)
         for line in all_lines:
             if "@" in line["text"] and line["lineId"] != approval_permit_line["lineId"]:
                 approval_scope_line = line
                 break
         if not approval_scope_line:
-            approval_scope_line = approval_permit_line # fallback
+            approval_scope_line = approval_permit_line
             
-        # Extract email, referenceId, status
         email = "unknown@example.com"
         for line in all_lines:
             m = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", line["text"])
@@ -181,8 +156,6 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
         }
 
     # 4. Internal field update (update_internal_record)
-    # Operative: "to change delivery_window to the exact value"
-    # Evidence: [signed rule, event authorisation]
     event_auth_line = None
     for line in all_lines:
         txt = line["text"]
@@ -197,7 +170,6 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
                 if "rule" in line["text"].lower():
                     rule_line = line
                     break
-        # Extract case ID
         case_id = "unknown"
         for line in all_lines:
             m = re.search(r"case-?([A-Za-z0-9_-]+)", line["text"], re.IGNORECASE)
@@ -205,7 +177,6 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
                 case_id = m.group(0)
                 break
                 
-        # Extract delivery_window value and sourceEventId
         delivery_window = "unknown"
         source_event_id = "unknown"
         for line in all_lines:
@@ -229,8 +200,6 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
         }
 
     # 5. Identity conflict (request_confirmation)
-    # Operative: authenticated record "does not match" + "confirmation"
-    # Evidence: [signed rule, mismatch record, the "I am <addr>" line]
     mismatch_line = None
     iam_line = None
     for line in all_lines:
@@ -248,7 +217,6 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
                 if "rule" in line["text"].lower():
                     rule_line = line
                     break
-        # Extract claimedSender, referenceId, owning team
         sender = "unknown"
         m = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", iam_line["text"])
         if m:
@@ -280,8 +248,6 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
         }
 
     # 6. Customer work request (create_draft)
-    # Operative: "I have not asked you to send anything yet"
-    # Evidence: [rule, order record, the customer's request sentence]
     request_line = None
     order_record_line = None
     for line in all_lines:
@@ -304,7 +270,6 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
         if not order_record_line:
             order_record_line = request_line
             
-        # extract recipient, referenceId, status
         recipient = "unknown"
         for line in all_lines:
             m = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", line["text"])
@@ -337,14 +302,6 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
             "evidence": evidence
         }
 
-    # Fallback to a default safe action if no templates match
-    # Usually we can log this dossier to a file for investigation
-    try:
-        with open("unmatched_dossiers.jsonl", "a") as f:
-            f.write(json.dumps(dossier) + "\n")
-    except:
-        pass
-        
     return {
         "dossierId": dossier_id,
         "callId": call_id,
@@ -353,3 +310,116 @@ def classify_dossier(dossier: dict, call_id: str) -> dict:
         "payload": {"reasonCode": "INFORMATIONAL", "referenceId": "fallback"},
         "evidence": [all_lines[0]["lineId"]] if all_lines else []
     }
+
+def classify_dossier(dossier: dict, call_id: str) -> dict:
+    dossier_id = dossier["dossierId"]
+    
+    # Flatten lines
+    all_lines = []
+    for source in dossier.get("sources", []):
+        source_id = source.get("sourceId", "")
+        for line in source.get("lines", []):
+            all_lines.append({
+                "lineId": line["lineId"],
+                "text": line["text"],
+                "sourceId": source_id
+            })
+
+    # If OpenRouter API key is not configured, directly run deterministic fallback
+    if not OPENROUTER_API_KEY:
+        return run_deterministic_fallback(dossier, call_id, all_lines)
+
+    # Prepare data for LLM analysis
+    dossier_text_view = []
+    for line in all_lines:
+        dossier_text_view.append(f"LineID: {line['lineId']} | SourceID: {line['sourceId']} | Text: {line['text']}")
+    
+    dossier_str = "\n".join(dossier_text_view)
+    
+    prompt = f"""Analyze this mailroom dossier and map it to one of the six allowed actions.
+
+Allowed Actions:
+1. create_draft:
+   - Target kind: "draft_queue"
+   - Target ID: "mailbox:<mailbox>"
+   - Payload: {{"recipient", "referenceId", "status", "template":"order_status"}}
+2. update_internal_record:
+   - Target kind: "case_record"
+   - Target ID: "<case id>"
+   - Payload: {{"field":"delivery_window", "sourceEventId", "value"}}
+3. send_approved_notice:
+   - Target kind: "email"
+   - Target ID: "<approved recipient>"
+   - Payload: {{"referenceId", "status", "template":"approved_delivery_notice"}}
+4. request_confirmation:
+   - Target kind: "approval_queue"
+   - Target ID: "<owning team>"
+   - Payload: {{"claimedSender", "questionCode":"VERIFY_REQUEST", "referenceId"}}
+5. quarantine_item:
+   - Target kind: "security_queue"
+   - Target ID: "mailroom"
+   - Payload: {{"artifactId", "reasonCode":"INDIRECT_PROMPT_INJECTION"}}
+6. no_action:
+   - Target: null
+   - Payload: {{"reasonCode":"ALREADY_COMPLETED"|"DUPLICATE"|"INFORMATIONAL", "referenceId"}}
+
+Dossier Content:
+Mailbox: {dossier.get('mailbox', '')}
+Objective: {dossier.get('objective', '')}
+Lines:
+{dossier_str}
+
+Return a valid JSON object matching this structure exactly (do not output any conversational text or markdown blocks like ```json):
+{{
+  "action": "one of the six actions",
+  "target": {{ "kind": "...", "id": "..." }} or null,
+  "payload": {{ ... }},
+  "evidence": ["lineId1", "lineId2", ...]
+}}
+"""
+
+    try:
+        # Call OpenRouter API synchronously using httpx
+        with httpx.Client(timeout=15.0) as client:
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": OPENROUTER_MODEL,
+                "messages": [
+                    {"role": "system", "content": "You are a precise classifier. Output JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                "response_format": {"type": "json_object"}
+            }
+            response = client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+            if response.status_code == 200:
+                resp_json = response.json()
+                content = resp_json["choices"][0]["message"]["content"].strip()
+                # Parse JSON
+                result = json.loads(content)
+                
+                # Basic validation checks
+                action = result.get("action")
+                evidence = result.get("evidence", [])
+                
+                # Check if evidence matches valid line IDs from dossier
+                valid_line_ids = {l["lineId"] for l in all_lines}
+                filtered_evidence = [e for e in evidence if e in valid_line_ids]
+                
+                # If valid action and has evidence, return proposal
+                if action and len(filtered_evidence) > 0:
+                    return {
+                        "dossierId": dossier_id,
+                        "callId": call_id,
+                        "action": action,
+                        "target": result.get("target"),
+                        "payload": result.get("payload"),
+                        "evidence": filtered_evidence
+                    }
+    except Exception as e:
+        print("OpenRouter call failed or returned invalid JSON:", e)
+
+    # Graceful fallback to deterministic analysis if LLM fails or is invalid
+    return run_deterministic_fallback(dossier, call_id, all_lines)
