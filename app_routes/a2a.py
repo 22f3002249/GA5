@@ -21,6 +21,18 @@ def load_db():
 
 _db = load_db()
 
+async def get_card_data():
+    base_url = os.environ.get("BASE_URL", "").rstrip("/")
+    return {
+        "name": "Invoice Audit Agent",
+        "description": "Enterprise agent for invoice batch processing.",
+        "version": "1.0.0",
+        "capabilities": {"invoice_action_agent": {"name": "Audit", "description": "Audits", "tags": ["finance"]}},
+        "supportedInterfaces": [{"protocolBinding": "HTTP+JSON", "protocolVersion": "1.0", "endpoint": f"{base_url}"}],
+        "defaultInputModes": ["application/vnd.ga5.invoice-claim-batch+json"],
+        "defaultOutputModes": ["application/vnd.ga5.invoice-action-proposals+json", "application/vnd.ga5.invoice-action-receipts+json"]
+    }
+
 async def save_db():
     async with STATE_LOCK:
         with open(STORAGE_FILE, "w") as f: json.dump(_db, f)
