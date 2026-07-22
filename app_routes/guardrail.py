@@ -117,7 +117,7 @@ def check_bash(command: str) -> Decision:
 
 
 def check_write_file(path: str) -> Decision:
-    resolved = norm_path(path, base=WORKDIR)
+    resolved = norm_path(path, base=WRITE_ROOT)
     allowed_root = os.path.normpath(WRITE_ROOT)
     if resolved == allowed_root or resolved.startswith(allowed_root + os.sep):
         return Decision(decision="allow", reason="Write target is inside the allowed /srv/reports directory.")
