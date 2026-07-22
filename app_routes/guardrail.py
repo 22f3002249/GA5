@@ -3,7 +3,6 @@ import re
 import base64
 import shlex
 import urllib.parse
-import sys
 from urllib.parse import urlparse
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -11,7 +10,6 @@ from typing import Optional, Literal
 
 router = APIRouter()
 
-# --- Configuration ---
 AGENT_HOME = "/home/agent"
 WORKDIR = "/home/agent/workspace"
 FORBIDDEN_FILE = "/home/agent/.env"
@@ -30,98 +28,81 @@ class Decision(BaseModel):
     decision: Literal["allow", "block"]
     reason: str
 
-def log(msg: str):
-    print(msg, file=sys.stdout, flush=True)
-
-def norm_path_agent(p: str, base: str) -> str:
-    """Standardize path resolution. If p is relative, it's joined to base."""
+def norm_path(p: str, base: str = WORKDIR) -> str:
+    """Resolve a path against base and normalize it."""
     p = p.strip()
-    # Manual tilde/home expansion
     if p.startswith("~"):
         p = p.replace("~", AGENT_HOME, 1)
-    if p.startswith("$HOME"):
-        p = p.replace("$HOME", AGENT_HOME, 1)
-    
     if not os.path.isabs(p):
         p = os.path.join(base, p)
     return os.path.normpath(p)
 
 def check_bash(command: str) -> Decision:
     cmd_lower = command.lower()
-    log(f"Checking Bash: {command}")
-
-    # 1. Aggressive Base64 Decoding
-    # Scan for any string that looks like base64 (8+ chars)
-    b64_candidates = re.findall(r'[A-Za-z0-9+/]{8,}={0,2}', command)
-    for b in b64_candidates:
+    
+    # 1. Base64 Obfuscated Check
+    b64_matches = re.findall(r'[A-Za-z0-9+/]{12,}={0,2}', command)
+    for b64 in b64_matches:
         try:
-            # Try decoding with varying padding
-            for pad in ["", "=", "=="]:
-                try:
-                    decoded = base64.b64decode(b + pad).decode('utf-8', errors='ignore')
-                    if ".env" in decoded.lower():
-                        return Decision(decision="block", reason="Obfuscated read attempt (.env found in b64).")
-                except: continue
-        except: pass
-
-    # 2. Strict Substring Check
-    # The policy says NEVER allowed to read .env. 
-    # If the command contains ".env" and any hint of the forbidden path, block.
-    if ".env" in cmd_lower:
-        # Check if it resolves to the forbidden file
-        # We extract tokens to find paths
-        tokens = []
-        try:
-            tokens = shlex.split(command)
+            decoded = base64.b64decode(b64).decode("utf-8", errors="ignore").lower()
+            if ".env" in decoded:
+                return Decision(decision="block", reason="Forbidden .env access in obfuscated command.")
         except:
-            tokens = command.split()
-        
-        forbidden = os.path.normpath(FORBIDDEN_FILE)
-        for t in tokens:
-            if ".env" in t.lower():
-                if norm_path_agent(t, WORKDIR) == forbidden:
-                    return Decision(decision="block", reason="Command resolves to forbidden .env file.")
-        
-        # Catch-all: If it contains .env and any path-like traversal or home ref
-        if any(x in cmd_lower for x in ["..", "/home/agent", "~", "$home"]):
-            return Decision(decision="block", reason="Suspicious .env access pattern.")
+            pass
 
-    return Decision(decision="allow", reason="Bash command safe.")
+    # 2. Path Traversal/Direct Access Check
+    # We check if any token in the command resolves to the forbidden file
+    try:
+        tokens = shlex.split(command)
+    except:
+        tokens = command.split()
+    
+    forbidden = os.path.normpath(FORBIDDEN_FILE)
+    for t in tokens:
+        if any(char in t for char in ["/", "~", "$", "."]):
+            try:
+                # Expand potential variables and normalize
+                expanded = t.replace("$HOME", AGENT_HOME).replace("$home", AGENT_HOME)
+                if norm_path(expanded, base=WORKDIR) == forbidden:
+                    return Decision(decision="block", reason="Command resolves to forbidden secrets file.")
+            except:
+                continue
+
+    # 3. Keyword block for .env in bash
+    if ".env" in cmd_lower and any(x in cmd_lower for x in ["cat", "grep", "less", "head", "tail", "cp", ".."]):
+        return Decision(decision="block", reason="Policy prevents accessing .env files.")
+
+    return Decision(decision="allow", reason="Command does not touch restricted paths.")
 
 def check_write_file(path: str) -> Decision:
-    log(f"Checking Write: {path}")
-    # 1. Handle URL-encoding attacks (%2e%2e)
+    # Decode to catch %2e%2e type traversal
     decoded_path = urllib.parse.unquote(path)
     
-    # 2. Resolve relative to WRITE_ROOT
-    # This is the "fix" for write-traversal 14/15.
-    # If the agent writes "report.txt", it becomes "/srv/reports/report.txt" (ALLOWED)
-    # If the agent writes "/etc/passwd", it stays "/etc/passwd" (BLOCKED)
-    # If the agent writes "../../home/agent/.env", it becomes "/home/agent/.env" (BLOCKED)
-    resolved = norm_path_agent(decoded_path, WRITE_ROOT)
+    # Resolve relative to WORKDIR because that's where the agent's process is
+    # If path is "report.txt", it resolves to /home/agent/workspace/report.txt
+    # This MUST be blocked because it's not in /srv/reports/
+    resolved = norm_path(decoded_path, base=WORKDIR)
     
-    root_norm = os.path.normpath(WRITE_ROOT)
-    # Ensure strict containment
-    if resolved == root_norm or resolved.startswith(root_norm + os.sep):
-        return Decision(decision="allow", reason="Write within allowed directory.")
+    allowed_root = os.path.normpath(WRITE_ROOT)
     
-    return Decision(decision="block", reason=f"Write outside {WRITE_ROOT} boundary.")
+    # Check if resolved path is strictly inside WRITE_ROOT
+    if resolved == allowed_root or resolved.startswith(allowed_root + os.sep):
+        return Decision(decision="allow", reason="Write target is inside the allowed directory.")
+    
+    return Decision(decision="block", reason="Write target resolves outside the allowed directory.")
 
 def check_http_request(url: str) -> Decision:
     try:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
         if host in ALLOWED_HOSTS:
-            return Decision(decision="allow", reason=f"Host {host} is allowed.")
+            return Decision(decision="allow", reason=f"Host {host} is in the allowed list.")
     except:
-        return Decision(decision="block", reason="Invalid URL.")
-    return Decision(decision="block", reason=f"Host '{host}' is forbidden.")
+        return Decision(decision="block", reason="Could not parse URL.")
+    return Decision(decision="block", reason="Host not allowed.")
 
 @router.post("/guardrail", response_model=Decision)
 def guardrail(call: ToolCall):
-    # Log incoming request immediately
-    log(f"INCOMING: tool={call.tool} cmd={call.command!r} path={call.path!r} url={call.url!r}")
-
     if call.tool == "bash":
         result = check_bash(call.command or "")
     elif call.tool == "write_file":
@@ -131,5 +112,8 @@ def guardrail(call: ToolCall):
     else:
         result = Decision(decision="block", reason="Unknown tool.")
 
-    log(f"OUTGOING: decision={result.decision} reason={result.reason}")
+    # EXACT LOGGING METHOD FROM YOUR ORIGINAL CODE (plus flush=True for Render)
+    print(f"GUARDRAIL_CHECK tool={call.tool} command={call.command!r} path={call.path!r} "
+          f"url={call.url!r} -> decision={result.decision} reason={result.reason}", flush=True)
+    
     return result
