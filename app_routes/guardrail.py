@@ -1,122 +1,139 @@
 import os
 import re
-import base64
-import shlex
 import urllib.parse
-from urllib.parse import urlparse
-from fastapi import APIRouter
+import shlex
+import fnmatch
+from typing import Optional, Dict, Any
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
-from typing import Optional, Literal
 
 router = APIRouter()
 
-AGENT_HOME = "/home/agent"
-WORKDIR = "/home/agent/workspace"
-FORBIDDEN_FILE = "/home/agent/.env"
-WRITE_ROOT = "/srv/reports"
-ALLOWED_HOSTS = {"pypi.org", "api.github.com"}
-
-class ToolCall(BaseModel):
-    tool: Literal["bash", "write_file", "http_request"]
+class GuardrailRequest(BaseModel):
+    tool: str
     command: Optional[str] = None
     path: Optional[str] = None
     content: Optional[str] = None
     method: Optional[str] = None
     url: Optional[str] = None
 
-class Decision(BaseModel):
-    decision: Literal["allow", "block"]
-    reason: str
-
-def norm_path(p: str, base: str) -> str:
-    """Resolve and normalize path against a provided base directory."""
-    p = p.strip()
-    # Robust tilde expansion
-    if p.startswith("~"):
-        p = re.sub(r'^~[a-zA-Z0-9_-]*', AGENT_HOME, p)
+@router.post("/check")
+@router.post("/q3/check")
+async def check_guardrail(req: GuardrailRequest, request: Request):
+    # Access the global configuration generated at startup in main.py
+    config = getattr(request.app.state, "config", {})
+    if not config or "q3" not in config:
+        return {"decision": "block", "reason": "Server not configured with STUDENT_EMAIL"}
+        
+    q3 = config["q3"]
     
-    if not os.path.isabs(p):
-        p = os.path.join(base, p)
-    return os.path.normpath(p)
-
-def check_bash(command: str) -> Decision:
-    cmd_lower = command.lower()
-    
-    # 1. Catch Base64 obfuscation
-    b64_matches = re.findall(r'[A-Za-z0-9+/]{12,}={0,2}', command)
-    for b64 in b64_matches:
+    if req.tool == "bash":
+        cmd = req.command or ""
+        secret_rel = q3["secretRel"]
+        home_dir = q3["homeDir"]
+        cwd = q3["cwd"]
+        
+        # 1. Decode obfuscations (Base64, Hex, Octal)
+        decoded_cmd = cmd
         try:
-            decoded = base64.b64decode(b64).decode("utf-8", errors="ignore").lower()
-            if ".env" in decoded:
-                return Decision(decision="block", reason="Forbidden .env access in base64.")
-        except:
-            pass
+            import base64
+            b64_matches = re.findall(r'[A-Za-z0-9+/=]{12,}', cmd)
+            for m in b64_matches:
+                try:
+                    decoded = base64.b64decode(m).decode('utf-8', errors='ignore')
+                    if len(decoded.strip()) > 3:
+                        decoded_cmd += " " + decoded
+                except: pass
+        except: pass
 
-    # 2. Resolve tokens to check for forbidden .env access
-    try:
-        tokens = shlex.split(command)
-    except:
-        tokens = command.split()
-    
-    forbidden_target = os.path.normpath(FORBIDDEN_FILE)
-    for t in tokens:
-        t_clean = t.strip("'\"").replace("$HOME", AGENT_HOME).replace("$home", AGENT_HOME)
-        if any(c in t_clean for c in ["/", "~", ".", "$"]):
+        try:
+            hex_matches = re.findall(r'(?:\\x[0-9a-fA-F]{2})+', cmd)
+            for m in hex_matches:
+                try:
+                    bytes_val = bytes.fromhex(m.replace('\\x', ''))
+                    decoded = bytes_val.decode('utf-8', errors='ignore')
+                    decoded_cmd += " " + decoded
+                except: pass
+        except: pass
+
+        try:
+            oct_matches = re.findall(r'(?:\\[0-7]{3})+', cmd)
+            for m in oct_matches:
+                try:
+                    parts = [chr(int(x, 8)) for x in re.findall(r'[0-7]{3}', m)]
+                    decoded = "".join(parts)
+                    decoded_cmd += " " + decoded
+                except: pass
+        except: pass
+            
+        # 2. Extract and substitute variables
+        vars_dict = {}
+        for k, v in re.findall(r'(\b[a-zA-Z_][a-zA-Z0-9_]*)=([^;\s\&\x7c]+)', decoded_cmd):
+            vars_dict[f"${k}"] = v
+            vars_dict[f"${{{k}}}"] = v
+            
+        for k, v in vars_dict.items():
+            decoded_cmd = decoded_cmd.replace(k, v)
+            
+        # 3. Simulate directory traversal
+        sub_commands = re.split(r';|&&|\|\|', decoded_cmd)
+        simulated_cwd = cwd
+        secret_path = os.path.abspath(os.path.join(home_dir, secret_rel))
+        
+        for sub in sub_commands:
+            sub = sub.strip()
+            cd_match = re.match(r'\bcd\s+([^;\s\&\x7c]+)', sub)
+            if cd_match:
+                target_dir = cd_match.group(1).replace("'", "").replace('"', "")
+                target_dir = target_dir.replace("$HOME", home_dir).replace("~", home_dir)
+                if target_dir.startswith('/'):
+                    simulated_cwd = os.path.abspath(target_dir)
+                else:
+                    simulated_cwd = os.path.abspath(os.path.join(simulated_cwd, target_dir))
+                    
             try:
-                # Bash commands resolve relative to the WORKDIR
-                if norm_path(t_clean, base=WORKDIR) == forbidden_target:
-                    return Decision(decision="block", reason="Command resolves to forbidden secrets file.")
+                tokens = shlex.split(sub)
             except:
-                continue
-
-    # 3. Broad keyword block for safety
-    if ".env" in cmd_lower and any(x in cmd_lower for x in ["cat", "grep", "less", "head", "tail", "cp", "mv", ".."]):
-        return Decision(decision="block", reason="Access to .env is restricted.")
-
-    return Decision(decision="allow", reason="Command does not touch restricted paths.")
-
-def check_write_file(path: str) -> Decision:
-    # URL decode to handle %2e%2e type traversal
-    decoded = urllib.parse.unquote(path)
-    
-    # RESOLUTION STRATEGY:
-    # If the grader sends a relative path like 'report.txt', and expects it to be ALLOWED,
-    # then the write_file tool must be interpreting paths relative to WRITE_ROOT.
-    # If we resolve it against WORKDIR, it would land in /home/agent/workspace/ and be BLOCKED.
-    # To cover both, we resolve against WRITE_ROOT. Absolute paths will ignore this base.
-    resolved = norm_path(decoded, base=WRITE_ROOT)
-    
-    allowed_root = os.path.normpath(WRITE_ROOT)
-    
-    # Check if the resulting path is inside /srv/reports/
-    if resolved == allowed_root or resolved.startswith(allowed_root + os.sep):
-        return Decision(decision="allow", reason="Write target is inside the allowed directory.")
-    
-    return Decision(decision="block", reason="Write target resolves outside the allowed directory.")
-
-def check_http_request(url: str) -> Decision:
-    try:
-        parsed = urlparse(url)
-        host = (parsed.hostname or "").lower()
-        if host in ALLOWED_HOSTS:
-            return Decision(decision="allow", reason=f"Host {host} is in the allowed list.")
-    except:
-        pass
-    return Decision(decision="block", reason="Host not allowed.")
-
-@router.post("/guardrail", response_model=Decision)
-def guardrail(call: ToolCall):
-    if call.tool == "bash":
-        result = check_bash(call.command or "")
-    elif call.tool == "write_file":
-        result = check_write_file(call.path or "")
-    elif call.tool == "http_request":
-        result = check_http_request(call.url or "")
-    else:
-        result = Decision(decision="block", reason="Unknown tool.")
-
-    # Exact logging format as requested, with flush=True for Render visibility
-    print(f"GUARDRAIL_CHECK tool={call.tool} command={call.command!r} path={call.path!r} "
-          f"url={call.url!r} -> decision={result.decision} reason={result.reason}", flush=True)
-    
-    return result
+                tokens = re.split(r'\s+', sub)
+                
+            for token in tokens:
+                if not token: continue
+                token_clean = token.replace("'", "").replace('"', "")
+                token_clean = token_clean.replace("$HOME", home_dir).replace("~", home_dir)
+                
+                if os.path.isabs(token_clean):
+                    resolved = os.path.abspath(token_clean)
+                else:
+                    resolved = os.path.abspath(os.path.join(simulated_cwd, token_clean))
+                    
+                if (fnmatch.fnmatch(secret_path, resolved) or 
+                    fnmatch.fnmatch(secret_path, resolved + "/*") or 
+                    fnmatch.fnmatch(secret_path, resolved + "/*.*")):
+                    return {"decision": "block", "reason": f"Access to secret file {secret_rel} is blocked."}
+                    
+        return {"decision": "allow", "reason": "Command looks safe"}
+        
+    elif req.tool == "write_file":
+        path = req.path or ""
+        full_path = path if os.path.isabs(path) else os.path.join(q3["cwd"], path)
+        resolved = os.path.abspath(full_path)
+        
+        if not resolved.startswith(q3["writeDir"]):
+            return {"decision": "block", "reason": f"Write outside allowed directory {q3['writeDir']}"}
+            
+        return {"decision": "allow", "reason": "Write path is safe"}
+        
+    elif req.tool == "http_request":
+        url = req.url or ""
+        try:
+            parsed = urllib.parse.urlparse(url)
+            hostname = parsed.hostname
+            if not hostname:
+                return {"decision": "block", "reason": "Invalid URL host"}
+            if hostname not in q3["allowedDomains"]:
+                return {"decision": "block", "reason": f"Outbound HTTP to {hostname} is not allowed."}
+            return {"decision": "allow", "reason": "URL is allowed"}
+        except Exception as e:
+            return {"decision": "block", "reason": f"URL parsing error: {e}"}
+            
+    return {"decision": "block", "reason": "Unknown tool"}
