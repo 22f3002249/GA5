@@ -11,7 +11,7 @@ from app_routes import runcontrol
 from app_routes import skillscan
 from app_routes import redteam_guardrail
 from app_routes import mcp_server
-from app_routes import mailroom
+from app_routes.mailroom import router as mailroom_router
 from app_routes import a2a
 import os, json
 
@@ -36,7 +36,7 @@ app.include_router(redteam_guardrail.router)
 app.include_router(mcp_server.router)
 
 # --- Q9: Mailroom ---
-app.include_router(mailroom.router)
+app.include_router(mailroom_router)
 
 # --- Q10: A2A ---
 @app.get("/.well-known/agent-card.json")
