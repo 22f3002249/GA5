@@ -9,7 +9,7 @@ import tempfile
 import threading
 from typing import Dict, Any, List
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Request, Response
 import httpx
 
 try:
@@ -31,7 +31,6 @@ ACTIONS = (
     "no_action",
 )
 
-# Safe fallback when decisions are ambiguous or uncertain
 SAFE_DEFAULT = "request_confirmation"
 NO_ACTION_REASONS = ("ALREADY_COMPLETED", "DUPLICATE", "INFORMATIONAL")
 
@@ -59,7 +58,8 @@ def _db_path():
 
 DB_PATH = _db_path()
 _lock = threading.Lock()
-_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+# Set a busy timeout of 30 seconds to prevent multi-process database locks
+_conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
 _conn.execute("PRAGMA journal_mode=WAL")
 _conn.execute("PRAGMA synchronous=NORMAL")
 _conn.executescript(
@@ -141,6 +141,16 @@ def call_id_for(dossier_id, fingerprint):
     return "mr_" + hashlib.sha256(
         ("q9v2|" + dossier_id + "|" + fingerprint).encode("utf-8")
     ).hexdigest()[:40]
+
+
+# --------------------------------------------------------- ERROR HELPERS
+def error_response(status_code: int, detail: str) -> Response:
+    """Enforces identical JSON structure and deterministic encoding on error boundaries."""
+    return Response(
+        status_code=status_code,
+        content=canonical({"detail": detail}),
+        media_type="application/json"
+    )
 
 
 # ------------------------------------------------------- TRIFECTA SCRUBBING
@@ -896,7 +906,6 @@ def verify_receipt_signature(verifier_jwk, receipt, eval_id=None) -> bool:
 
         sig_bytes = decode_base64(sig_b64)
 
-        # Extract fields
         call_id = receipt.get("callId", "")
         proposal_digest = receipt.get("proposalDigest", "")
         receipt_id = receipt.get("receiptId", "")
@@ -1005,32 +1014,17 @@ def bind_receipts(eval_id, receipts, proposals, verifier):
         call_id = r.get("callId", "").strip()
         proposal = by_call.get(call_id)
         if proposal is None:
-            raise HTTPException(
-                status_code=409,
-                detail=f"receipt callId {call_id} does not belong to evaluation {eval_id}",
-            )
+            return error_response(409, f"receipt callId {call_id} does not belong to evaluation {eval_id}")
         if r.get("dossierId") != proposal["dossierId"]:
-            raise HTTPException(
-                status_code=409,
-                detail=f"receipt dossierId does not match proposal {call_id}",
-            )
+            return error_response(409, f"receipt dossierId does not match proposal {call_id}")
         if r.get("action") != proposal["action"]:
-            raise HTTPException(
-                status_code=409,
-                detail=f"receipt action does not match proposal {call_id}",
-            )
+            return error_response(409, f"receipt action does not match proposal {call_id}")
         if r.get("proposalDigest") != proposal_digest(proposal):
-            raise HTTPException(
-                status_code=409,
-                detail=f"receipt proposalDigest does not match proposal {call_id}",
-            )
+            return error_response(409, f"receipt proposalDigest does not match proposal {call_id}")
 
         # Verify signature passing eval_id
         if not verify_receipt_signature(verifier, r, eval_id):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid cryptographic signature for receipt {call_id}",
-            )
+            return error_response(400, f"Invalid cryptographic signature for receipt {call_id}")
 
         bound.append((r, proposal))
 
@@ -1038,10 +1032,7 @@ def bind_receipts(eval_id, receipts, proposals, verifier):
         c for c in by_call if c not in {r.get("callId", "").strip() for r in receipts}
     ]
     if missing:
-        raise HTTPException(
-            status_code=409,
-            detail="commit is missing receipts for: " + ", ".join(sorted(missing)),
-        )
+        return error_response(409, "commit is missing receipts for: " + ", ".join(sorted(missing)))
     return bound
 
 
@@ -1050,68 +1041,63 @@ def bind_receipts(eval_id, receipts, proposals, verifier):
 async def handle_mailroom(request: Request):
     raw = await request.body()
     if len(raw) > MAX_BODY_BYTES:
-        raise HTTPException(status_code=413, detail="body too large")
+        return error_response(413, "body too large")
     try:
         body = json.loads(raw or b"")
     except (json.JSONDecodeError, UnicodeDecodeError):
-        raise HTTPException(status_code=422, detail="body is not valid JSON")
+        return error_response(422, "body is not valid JSON")
     if not isinstance(body, dict):
-        raise HTTPException(status_code=422, detail="body must be a JSON object")
+        return error_response(422, "body must be a JSON object")
 
     if body.get("profile") != PROFILE:
-        raise HTTPException(status_code=400, detail="unsupported profile")
+        return error_response(400, "unsupported profile")
 
     operation = body.get("operation")
     if not isinstance(operation, str):
-        raise HTTPException(status_code=422, detail="operation is required")
+        return error_response(422, "operation is required")
     operation = operation.strip()
     if operation == "propose":
         return await do_propose(body)
     if operation == "commit":
         return await do_commit(body)
-    raise HTTPException(status_code=400, detail="unknown operation")
+    return error_response(400, "unknown operation")
 
 
 # ------------------------------------------------------------------ PROPOSE
 def validate_propose(body):
     eval_id = body.get("evaluationId")
     if not isinstance(eval_id, str) or not eval_id.strip():
-        raise HTTPException(status_code=422, detail="evaluationId is required")
+        return error_response(422, "evaluationId is required")
     eval_id = eval_id.strip()
 
     dossiers = body.get("dossiers")
     if not isinstance(dossiers, list) or not dossiers:
-        raise HTTPException(
-            status_code=422, detail="dossiers must be a non-empty array"
-        )
+        return error_response(422, "dossiers must be a non-empty array")
     if len(dossiers) > MAX_DOSSIERS:
-        raise HTTPException(status_code=422, detail="too many dossiers")
+        return error_response(422, "too many dossiers")
 
     ids, seen = [], set()
     for d in dossiers:
         if not isinstance(d, dict):
-            raise HTTPException(
-                status_code=422, detail="each dossier must be an object"
-            )
+            return error_response(422, "each dossier must be an object")
         did = d.get("dossierId")
         if not isinstance(did, str) or not did.strip():
-            raise HTTPException(status_code=422, detail="dossier is missing dossierId")
+            return error_response(422, "dossier is missing dossierId")
         did = did.strip()
         if not isinstance(d.get("sources"), list):
-            raise HTTPException(
-                status_code=422, detail=f"dossier {did} is missing sources"
-            )
+            return error_response(422, f"dossier {did} is missing sources")
         if did in seen:
-            raise HTTPException(
-                status_code=400, detail=f"duplicate dossierId: {did}"
-            )
+            return error_response(400, f"duplicate dossierId: {did}")
         seen.add(did)
         ids.append(did)
     return eval_id, dossiers, ids
 
 
 async def do_propose(body):
-    eval_id, dossiers, ids = validate_propose(body)
+    val = validate_propose(body)
+    if isinstance(val, Response):
+        return val
+    eval_id, dossiers, ids = val
     input_digest = digest(dossiers)
 
     row = _get("q9_v4_evals", "eval_id", eval_id)
@@ -1121,11 +1107,8 @@ async def do_propose(body):
             client_response = {
                 k: v for k, v in resp_dict.items() if k != "_receiptVerifier"
             }
-            return client_response
-        raise HTTPException(
-            status_code=409,
-            detail="evaluationId already used with different content",
-        )
+            return Response(content=canonical(client_response), media_type="application/json")
+        return error_response(409, "evaluationId already used with different content")
 
     fingerprints = [fingerprint_of(d) for d in dossiers]
 
@@ -1182,51 +1165,48 @@ async def do_propose(body):
     client_response = {
         k: v for k, v in response.items() if k != "_receiptVerifier"
     }
-    return client_response
+    return Response(content=canonical(client_response), media_type="application/json")
 
 
 # ------------------------------------------------------------------ COMMIT
 def validate_commit(body):
     eval_id = body.get("evaluationId")
     if not isinstance(eval_id, str) or not eval_id.strip():
-        raise HTTPException(status_code=422, detail="evaluationId is required")
+        return error_response(422, "evaluationId is required")
     eval_id = eval_id.strip()
 
     input_digest = body.get("inputDigest")
     if not isinstance(input_digest, str) or not input_digest.strip():
-        raise HTTPException(status_code=422, detail="inputDigest is required")
+        return error_response(422, "inputDigest is required")
     input_digest = input_digest.strip()
 
     receipts = body.get("receipts")
     if not isinstance(receipts, list) or not receipts:
-        raise HTTPException(
-            status_code=422, detail="receipts must be a non-empty array"
-        )
+        return error_response(422, "receipts must be a non-empty array")
     if len(receipts) > MAX_RECEIPTS:
-        raise HTTPException(status_code=422, detail="too many receipts")
+        return error_response(422, "too many receipts")
     seen = set()
     for r in receipts:
         if not isinstance(r, dict):
-            raise HTTPException(
-                status_code=422, detail="each receipt must be an object"
-            )
+            return error_response(422, "each receipt must be an object")
         call_id = r.get("callId")
         if not isinstance(call_id, str) or not call_id.strip():
-            raise HTTPException(status_code=422, detail="receipt is missing callId")
+            return error_response(422, "receipt is missing callId")
         if not isinstance(r.get("accepted"), bool):
-            raise HTTPException(status_code=422, detail="receipt is missing accepted")
+            return error_response(422, "receipt is missing accepted")
         if not isinstance(r.get("receiptId"), str) or not r["receiptId"].strip():
-            raise HTTPException(status_code=422, detail="receipt is missing receiptId")
+            return error_response(422, "receipt is missing receiptId")
         if call_id in seen:
-            raise HTTPException(
-                status_code=400, detail="duplicate callId in receipts"
-            )
+            return error_response(400, "duplicate callId in receipts")
         seen.add(call_id)
     return eval_id, input_digest, receipts
 
 
 async def do_commit(body):
-    eval_id, input_digest, receipts = validate_commit(body)
+    val = validate_commit(body)
+    if isinstance(val, Response):
+        return val
+    eval_id, input_digest, receipts = val
 
     # 1. Fetch from q9_v4_commits to handle Replays and Conflicts
     hit = _get("q9_v4_commits", "commit_key", eval_id)
@@ -1234,27 +1214,24 @@ async def do_commit(body):
         saved_record = json.loads(hit[1])
         # Exact replay check: match inputDigest AND receipts
         if saved_record.get("inputDigest") == input_digest and saved_record.get("receipts_digest") == digest(receipts):
-            return saved_record.get("response")
+            return Response(content=canonical(saved_record.get("response")), media_type="application/json")
         # Same evaluationId but with modified content -> Conflict!
-        raise HTTPException(
-            status_code=409,
-            detail="Conflict: evaluationId already committed with different content",
-        )
+        return error_response(409, "Conflict: evaluationId already committed with different content")
 
     # 2. Verify state against the initial proposal
     row = _get("q9_v4_evals", "eval_id", eval_id)
     if row is None:
-        raise HTTPException(status_code=409, detail="unknown evaluationId")
+        return error_response(409, "unknown evaluationId")
     if row[1] != input_digest:
-        raise HTTPException(
-            status_code=409, detail="inputDigest does not match evaluation"
-        )
+        return error_response(409, "inputDigest does not match evaluation")
 
     eval_data = json.loads(row[2])
     proposals = eval_data["proposals"]
     verifier = eval_data.get("_receiptVerifier")
 
     bound = bind_receipts(eval_id, receipts, proposals, verifier)
+    if isinstance(bound, Response):
+        return bound
 
     outcomes = []
     for r, proposal in bound:
@@ -1296,4 +1273,4 @@ async def do_commit(body):
             "response": response
         }, ensure_ascii=False)),
     )
-    return response
+    return Response(content=canonical(response), media_type="application/json")
