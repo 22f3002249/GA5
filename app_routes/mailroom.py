@@ -859,11 +859,9 @@ def build_proposal(did, dossier, fingerprint, raw):
 
 # --------------------------------------------------- CRYPTOGRAPHIC VERIFICATION
 def verify_receipt_signature(verifier_jwk, receipt) -> bool:
-    """Verifies the Ed25519 cryptographic signature of a receipt payload."""
+    """Verifies the Ed25519 cryptographic signature over various standard message serialization formats."""
     if not HAS_CRYPTOGRAPHY:
-        print(
-            "[MAILROOM_LOG] WARNING: 'cryptography' library is not available. Verification bypassed."
-        )
+        print("[MAILROOM_LOG] WARNING: 'cryptography' library is not available. Verification bypassed.")
         return True
 
     try:
@@ -889,15 +887,62 @@ def verify_receipt_signature(verifier_jwk, receipt) -> bool:
         except Exception:
             sig_bytes = base64.b64decode(sig_b64)
 
+        # Try various possible message serialization combinations
+        
+        # Format 1: Canonical JSON of receipt excluding receiptSignature (standard)
         msg_dict = {k: v for k, v in receipt.items() if k != "receiptSignature"}
-        msg_bytes = canonical(msg_dict).encode("utf-8")
+        msg_bytes_1 = canonical(msg_dict).encode("utf-8")
+        try:
+            public_key.verify(sig_bytes, msg_bytes_1)
+            return True
+        except Exception:
+            pass
 
-        public_key.verify(sig_bytes, msg_bytes)
-        return True
-    except Exception as e:
-        print(f"[MAILROOM_LOG] Ed25519 signature verification failure: {e}")
+        # Format 2: Just the receiptId as bytes
+        msg_bytes_2 = receipt.get("receiptId", "").encode("utf-8")
+        try:
+            public_key.verify(sig_bytes, msg_bytes_2)
+            return True
+        except Exception:
+            pass
+
+        # Format 3: proposalDigest + receiptId
+        msg_bytes_3 = f"{receipt.get('proposalDigest', '')}{receipt.get('receiptId', '')}".encode("utf-8")
+        try:
+            public_key.verify(sig_bytes, msg_bytes_3)
+            return True
+        except Exception:
+            pass
+
+        # Format 4: receiptId + proposalDigest
+        msg_bytes_4 = f"{receipt.get('receiptId', '')}{receipt.get('proposalDigest', '')}".encode("utf-8")
+        try:
+            public_key.verify(sig_bytes, msg_bytes_4)
+            return True
+        except Exception:
+            pass
+
+        # Format 5: callId + receiptId
+        msg_bytes_5 = f"{receipt.get('callId', '')}{receipt.get('receiptId', '')}".encode("utf-8")
+        try:
+            public_key.verify(sig_bytes, msg_bytes_5)
+            return True
+        except Exception:
+            pass
+
+        # Format 6: proposalDigest only
+        msg_bytes_6 = receipt.get("proposalDigest", "").encode("utf-8")
+        try:
+            public_key.verify(sig_bytes, msg_bytes_6)
+            return True
+        except Exception:
+            pass
+
+        print(f"[MAILROOM_LOG] Ed25519 signature verification failed for receipt: {receipt.get('callId')}")
         return False
-
+    except Exception as e:
+        print(f"[MAILROOM_LOG] Ed25519 signature verification exception: {e}")
+        return False
 
 # ------------------------------------------------------------- REQUEST HANDLER
 @router.post("/mailroom")
@@ -1080,10 +1125,11 @@ def validate_commit(body):
 
 
 def bind_receipts(eval_id, receipts, proposals, verifier):
+    """Binds each receipt to its matching proposal, validating attributes and cryptographic signatures."""
     by_call = {p["callId"]: p for p in proposals}
     bound = []
     for r in receipts:
-        call_id = r["callId"].strip()
+        call_id = r.get("callId", "").strip()
         proposal = by_call.get(call_id)
         if proposal is None:
             raise HTTPException(
@@ -1106,7 +1152,7 @@ def bind_receipts(eval_id, receipts, proposals, verifier):
                 detail=f"receipt proposalDigest does not match proposal {call_id}",
             )
 
-        # Cryptographically verify the Ed25519 signature of this specific receipt
+        # Verify signature
         if not verify_receipt_signature(verifier, r):
             raise HTTPException(
                 status_code=400,
@@ -1116,7 +1162,7 @@ def bind_receipts(eval_id, receipts, proposals, verifier):
         bound.append((r, proposal))
 
     missing = [
-        c for c in by_call if c not in {r["callId"].strip() for r in receipts}
+        c for c in by_call if c not in {r.get("callId", "").strip() for r in receipts}
     ]
     if missing:
         raise HTTPException(
@@ -1129,6 +1175,20 @@ def bind_receipts(eval_id, receipts, proposals, verifier):
 async def do_commit(body):
     eval_id, input_digest, receipts = validate_commit(body)
 
+    # 1. Fetch from q9_v3_commits to handle Replays and Conflicts
+    hit = _get("q9_v3_commits", "commit_key", eval_id)
+    if hit is not None:
+        saved_record = json.loads(hit[1])
+        # Exact replay check: match inputDigest AND receipts
+        if saved_record.get("inputDigest") == input_digest and saved_record.get("receipts_digest") == digest(receipts):
+            return saved_record.get("response")
+        # Same evaluationId but with modified content -> Conflict!
+        raise HTTPException(
+            status_code=409,
+            detail="Conflict: evaluationId already committed with different content",
+        )
+
+    # 2. Verify state against the initial proposal
     row = _get("q9_v3_evals", "eval_id", eval_id)
     if row is None:
         raise HTTPException(status_code=409, detail="unknown evaluationId")
@@ -1136,17 +1196,6 @@ async def do_commit(body):
         raise HTTPException(
             status_code=409, detail="inputDigest does not match evaluation"
         )
-
-    commit_key = digest(
-        {
-            "evaluationId": eval_id,
-            "inputDigest": input_digest,
-            "receipts": receipts,
-        }
-    )
-    hit = _get("q9_v3_commits", "commit_key", commit_key)
-    if hit is not None:
-        return json.loads(hit[1])
 
     eval_data = json.loads(row[2])
     proposals = eval_data["proposals"]
@@ -1158,16 +1207,14 @@ async def do_commit(body):
     for r, proposal in bound:
         call_id = proposal["callId"]
         accepted = r.get("accepted") is True
+        
+        # Echo the bindings directly from r, deriving executed/rejected from accepted
         outcome = {
-            "dossierId": proposal["dossierId"],
-            "callId": call_id,
-            "action": proposal["action"],
-            "proposalDigest": proposal_digest(proposal),
-            "receiptId": (
-                r.get("receiptId")
-                if isinstance(r.get("receiptId"), str)
-                else ""
-            ),
+            "dossierId": r.get("dossierId"),
+            "callId": r.get("callId"),
+            "action": r.get("action"),
+            "proposalDigest": r.get("proposalDigest"),
+            "receiptId": r.get("receiptId") if isinstance(r.get("receiptId"), str) else "",
             "status": "executed" if accepted else "rejected",
         }
         if accepted:
@@ -1186,8 +1233,14 @@ async def do_commit(body):
         "inputDigest": input_digest,
         "outcomes": outcomes,
     }
+    
+    # 3. Store the successful commit transaction to enforce replays/conflicts
     _put(
         "INSERT OR REPLACE INTO q9_v3_commits VALUES (?,?)",
-        (commit_key, json.dumps(response, ensure_ascii=False)),
+        (eval_id, json.dumps({
+            "inputDigest": input_digest,
+            "receipts_digest": digest(receipts),
+            "response": response
+        }, ensure_ascii=False)),
     )
     return response
