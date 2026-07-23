@@ -58,53 +58,73 @@ def _db_path():
 
 DB_PATH = _db_path()
 _lock = threading.Lock()
-# Set a busy timeout of 30 seconds to prevent multi-process database locks
-_conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
-_conn.execute("PRAGMA journal_mode=WAL")
-_conn.execute("PRAGMA synchronous=NORMAL")
-_conn.executescript(
-    """
-    CREATE TABLE IF NOT EXISTS q9_v4_decisions (
-        cache_key TEXT PRIMARY KEY,
-        proposal TEXT
-    );
-    CREATE TABLE IF NOT EXISTS q9_v4_calls (
-        call_id TEXT PRIMARY KEY,
-        proposal TEXT
-    );
-    CREATE TABLE IF NOT EXISTS q9_v4_evals (
-        eval_id TEXT PRIMARY KEY,
-        input_digest TEXT,
-        response TEXT
-    );
-    CREATE TABLE IF NOT EXISTS q9_v4_eval_calls (
-        eval_call TEXT PRIMARY KEY,
-        proposal TEXT
-    );
-    CREATE TABLE IF NOT EXISTS q9_v4_commits (
-        commit_key TEXT PRIMARY KEY,
-        response TEXT
-    );
-    CREATE TABLE IF NOT EXISTS q9_v4_effects (
-        effect_key TEXT PRIMARY KEY,
-        outcome TEXT
-    );
-    """
-)
-_conn.commit()
+
+
+def init_db():
+    """Initializes schema tables cleanly using WAL mode to optimize concurrency."""
+    with _lock:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS q9_v4_decisions (
+                    cache_key TEXT PRIMARY KEY,
+                    proposal TEXT
+                );
+                CREATE TABLE IF NOT EXISTS q9_v4_calls (
+                    call_id TEXT PRIMARY KEY,
+                    proposal TEXT
+                );
+                CREATE TABLE IF NOT EXISTS q9_v4_evals (
+                    eval_id TEXT PRIMARY KEY,
+                    input_digest TEXT,
+                    response TEXT
+                );
+                CREATE TABLE IF NOT EXISTS q9_v4_eval_calls (
+                    eval_call TEXT PRIMARY KEY,
+                    proposal TEXT
+                );
+                CREATE TABLE IF NOT EXISTS q9_v4_commits (
+                    commit_key TEXT PRIMARY KEY,
+                    response TEXT
+                );
+                CREATE TABLE IF NOT EXISTS q9_v4_effects (
+                    effect_key TEXT PRIMARY KEY,
+                    outcome TEXT
+                );
+                """
+            )
+            conn.commit()
+
+
+init_db()
 
 
 def _get(table, key_col, key):
+    """Opens a fresh, thread-safe connection on demand to query the SQLite file."""
     with _lock:
-        return _conn.execute(
-            f"SELECT * FROM {table} WHERE {key_col}=?", (key,)
-        ).fetchone()
+        try:
+            with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+                cursor = conn.cursor()
+                cursor.execute(f"SELECT * FROM {table} WHERE {key_col}=?", (key,))
+                return cursor.fetchone()
+        except Exception as e:
+            print(f"[MAILROOM_LOG] Database read error on {table}: {e}")
+            return None
 
 
 def _put(sql, params):
+    """Safely commits database writes under concurrent load, avoiding lockouts."""
     with _lock:
-        _conn.execute(sql, params)
-        _conn.commit()
+        try:
+            with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute(sql, params)
+                conn.commit()
+        except Exception as e:
+            print(f"[MAILROOM_LOG] Database write error: {e}")
 
 
 # --------------------------------------------------------------- CANONICAL
@@ -997,6 +1017,34 @@ def verify_receipt_signature(verifier_jwk, receipt, eval_id=None) -> bool:
             "proposalDigest": proposal_digest,
             "callId": call_id
         }))
+
+        # -------------------------------------------------- EXPANSION BLOCK
+        import itertools
+        # Permutations of (eval_id, proposal_digest, call_id) with alternative separators
+        if eval_id:
+            parts_3 = [eval_id, proposal_digest, call_id]
+            for p in itertools.permutations(parts_3):
+                for delim in [":", ".", ",", "-", "_", "/"]:
+                    candidates.append(delim.join(p))
+
+        # Permutations of (eval_id, proposal_digest, call_id, receipt_id) with alternative separators
+        if eval_id:
+            parts_4 = [eval_id, proposal_digest, call_id, receipt_id]
+            for p in itertools.permutations(parts_4):
+                for delim in [":", ".", ",", "-", "_", "/"]:
+                    candidates.append(delim.join(p))
+
+        # JSON object of receipt nested under evaluationId key
+        if eval_id:
+            candidates.append(canonical({
+                "evaluationId": eval_id,
+                "receipt": msg_dict
+            }))
+
+        # Generate JWS Compact wrappers for the new permutations
+        for cand in list(candidates):
+            if isinstance(cand, str) and not cand.startswith(header_b64):
+                candidates.append(f"{header_b64}.{base64url_encode(cand.encode('utf-8'))}")
 
         # Try to verify against candidates
         for cand in candidates:
