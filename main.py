@@ -13,7 +13,7 @@ from app_routes import redteam_guardrail
 from app_routes import mcp_server
 from app_routes import mailroom
 from app_routes import a2a
-import os, json
+import os, json, subprocess
 
 app = FastAPI(title="exam-endpoints")
 
@@ -21,6 +21,26 @@ app = FastAPI(title="exam-endpoints")
 app.include_router(proration.router)
 
 # --- Q3: Pre-tool-call guardrail ---
+def load_student_config():
+    email = os.environ.get("STUDENT_EMAIL") or os.environ.get("EMAIL")
+    if not email:
+        print("⚠️ WARNING: STUDENT_EMAIL env var is not set!", flush=True)
+        return
+        
+    # Runs generator.js to write the configurations to app.state.config
+    for cmd in ["node", "nodejs"]:
+        try:
+            res = subprocess.run([cmd, "generator.js", email], capture_output=True, text=True, check=True)
+            app.state.config = json.loads(res.stdout)
+            print("✅ Successfully loaded student configurations!", flush=True)
+            return
+        except Exception as e:
+            print(f"ℹ️ Try with '{cmd}' failed: {e}", flush=True)
+
+@app.on_event("startup")
+def startup_event():
+    load_student_config()
+
 app.include_router(guardrail.router)
 
 # --- Q5: Run-budget-and-loop-guard ---
