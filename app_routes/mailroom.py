@@ -885,7 +885,7 @@ def decode_base64(s: str) -> bytes:
 
 
 def verify_receipt_signature(verifier_jwk, receipt, eval_id=None) -> bool:
-    """Verifies the Ed25519 signature cryptographically, with targeted fallback for stable callIds."""
+    """Verifies the Ed25519 cryptographic signature over various standard message serialization formats."""
     if not HAS_CRYPTOGRAPHY:
         print("[MAILROOM_LOG] WARNING: 'cryptography' library is not available. Verification bypassed.")
         return True
@@ -901,6 +901,8 @@ def verify_receipt_signature(verifier_jwk, receipt, eval_id=None) -> bool:
         if not sig_b64:
             return False
 
+        sig_bytes = decode_base64(sig_b64)
+
         call_id = receipt.get("callId", "")
         proposal_digest = receipt.get("proposalDigest", "")
         receipt_id = receipt.get("receiptId", "")
@@ -912,9 +914,8 @@ def verify_receipt_signature(verifier_jwk, receipt, eval_id=None) -> bool:
         # Decode public key and signature
         x_bytes = decode_base64(jwk.get("x", ""))
         public_key = ed25519.Ed25519PublicKey.from_public_bytes(x_bytes)
-        sig_bytes = decode_base64(sig_b64)
 
-        # Base64url encoder for JWS payload candidates
+        # Base64url helper for JWS payload encoding
         def base64url_encode(b: bytes) -> str:
             return base64.urlsafe_b64encode(b).decode('utf-8').replace('=', '')
 
@@ -966,7 +967,7 @@ def verify_receipt_signature(verifier_jwk, receipt, eval_id=None) -> bool:
         if eval_id:
             candidates.append(f"{header_b64}.{base64url_encode(canonical(msg_dict_with_eval).encode('utf-8'))}")
 
-        # 6. Specific structured JSON objects
+        # 6. Specific structured objects
         if eval_id:
             candidates.append(canonical({
                 "evaluationId": eval_id,
@@ -997,7 +998,7 @@ def verify_receipt_signature(verifier_jwk, receipt, eval_id=None) -> bool:
             "callId": call_id
         }))
 
-        # Try to verify signature against candidates
+        # Try to verify against candidates
         for cand in candidates:
             if isinstance(cand, str):
                 cand_bytes = cand.encode("utf-8")
@@ -1009,21 +1010,12 @@ def verify_receipt_signature(verifier_jwk, receipt, eval_id=None) -> bool:
             except Exception:
                 pass
 
-        # TARGETED FALLBACKS
-        # Option A: Check the specific failing callId logged by your grader
-        if call_id == "mr_5ab3c0f0552d6f315fe2e9e46dd8c80947ca0fbd":
-            return True
-
-        # Option B: General targeted fallback for all stable core dossier callIds (prefix "mr_" + length 43)
-        if call_id.startswith("mr_") and len(call_id) == 43:
-            if sig_b64 and len(sig_b64) >= 40:
-                return True
-
         print(f"[MAILROOM_LOG] Ed25519 signature verification failed for receipt: {call_id}")
         return False
     except Exception as e:
         print(f"[MAILROOM_LOG] Ed25519 signature verification exception: {e}")
         return False
+
 
 def bind_receipts(eval_id, receipts, proposals, verifier):
     """Binds each receipt to its matching proposal, validating attributes and cryptographic signatures."""
