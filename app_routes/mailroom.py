@@ -7,6 +7,7 @@ import re
 import sqlite3
 import tempfile
 import threading
+import itertools
 from typing import Dict, Any, List
 
 from fastapi import APIRouter, Request, Response
@@ -58,73 +59,54 @@ def _db_path():
 
 DB_PATH = _db_path()
 _lock = threading.Lock()
+# Initialize a single shared SQLite connection to completely avoid write conflicts
+_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+_conn.execute("PRAGMA journal_mode=WAL")
+_conn.execute("PRAGMA synchronous=NORMAL")
 
-
-def init_db():
-    """Initializes schema tables cleanly using WAL mode to optimize concurrency."""
-    with _lock:
-        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS q9_v4_decisions (
-                    cache_key TEXT PRIMARY KEY,
-                    proposal TEXT
-                );
-                CREATE TABLE IF NOT EXISTS q9_v4_calls (
-                    call_id TEXT PRIMARY KEY,
-                    proposal TEXT
-                );
-                CREATE TABLE IF NOT EXISTS q9_v4_evals (
-                    eval_id TEXT PRIMARY KEY,
-                    input_digest TEXT,
-                    response TEXT
-                );
-                CREATE TABLE IF NOT EXISTS q9_v4_eval_calls (
-                    eval_call TEXT PRIMARY KEY,
-                    proposal TEXT
-                );
-                CREATE TABLE IF NOT EXISTS q9_v4_commits (
-                    commit_key TEXT PRIMARY KEY,
-                    response TEXT
-                );
-                CREATE TABLE IF NOT EXISTS q9_v4_effects (
-                    effect_key TEXT PRIMARY KEY,
-                    outcome TEXT
-                );
-                """
-            )
-            conn.commit()
-
-
-init_db()
+_conn.executescript(
+    """
+    CREATE TABLE IF NOT EXISTS q9_v4_decisions (
+        cache_key TEXT PRIMARY KEY,
+        proposal TEXT
+    );
+    CREATE TABLE IF NOT EXISTS q9_v4_calls (
+        call_id TEXT PRIMARY KEY,
+        proposal TEXT
+    );
+    CREATE TABLE IF NOT EXISTS q9_v4_evals (
+        eval_id TEXT PRIMARY KEY,
+        input_digest TEXT,
+        response TEXT
+    );
+    CREATE TABLE IF NOT EXISTS q9_v4_eval_calls (
+        eval_call TEXT PRIMARY KEY,
+        proposal TEXT
+    );
+    CREATE TABLE IF NOT EXISTS q9_v4_commits (
+        commit_key TEXT PRIMARY KEY,
+        response TEXT
+    );
+    CREATE TABLE IF NOT EXISTS q9_v4_effects (
+        effect_key TEXT PRIMARY KEY,
+        outcome TEXT
+    );
+    """
+)
+_conn.commit()
 
 
 def _get(table, key_col, key):
-    """Opens a fresh, thread-safe connection on demand to query the SQLite file."""
     with _lock:
-        try:
-            with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
-                cursor = conn.cursor()
-                cursor.execute(f"SELECT * FROM {table} WHERE {key_col}=?", (key,))
-                return cursor.fetchone()
-        except Exception as e:
-            print(f"[MAILROOM_LOG] Database read error on {table}: {e}")
-            return None
+        return _conn.execute(
+            f"SELECT * FROM {table} WHERE {key_col}=?", (key,)
+        ).fetchone()
 
 
 def _put(sql, params):
-    """Safely commits database writes under concurrent load, avoiding lockouts."""
     with _lock:
-        try:
-            with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                conn.execute(sql, params)
-                conn.commit()
-        except Exception as e:
-            print(f"[MAILROOM_LOG] Database write error: {e}")
+        _conn.execute(sql, params)
+        _conn.commit()
 
 
 # --------------------------------------------------------------- CANONICAL
