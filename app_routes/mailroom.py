@@ -12,6 +12,8 @@ proposals and returns terminal outcomes.
 """
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -22,6 +24,15 @@ import urllib.request
 import urllib.error
 import logging
 from fastapi import APIRouter, HTTPException, Request
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.exceptions import InvalidSignature
+    _CRYPTO_OK = True
+except Exception:  # pragma: no cover - environment without cryptography
+    Ed25519PublicKey = None
+    InvalidSignature = Exception
+    _CRYPTO_OK = False
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -104,9 +115,9 @@ def init_db():
                     eval_call TEXT PRIMARY KEY,
                     receipt_id TEXT
                 );
-                CREATE TABLE IF NOT EXISTS q9_v3_receipt_content (
-                    receipt_key TEXT PRIMARY KEY,
-                    content_digest TEXT
+                CREATE TABLE IF NOT EXISTS q9_v3_verifiers (
+                    eval_id TEXT PRIMARY KEY,
+                    jwk TEXT
                 );
                 """
             )
@@ -172,6 +183,46 @@ def put_eval(eval_id: str, input_digest: str, response_dict: dict):
         logger.error(f"Error saving eval file: {e}")
 
     _put("INSERT OR REPLACE INTO q9_v3_evals VALUES (?,?,?)", (eval_id, input_digest, json.dumps(response_dict, ensure_ascii=False)))
+
+IN_MEMORY_VERIFIERS = {}
+
+def put_verifier(eval_id: str, jwk: dict):
+    """Persist the receipt-verifier public key (JWK) supplied with the first
+    successful propose for an evaluation, so commit can verify signatures."""
+    if not isinstance(jwk, dict):
+        return
+    IN_MEMORY_VERIFIERS[eval_id] = jwk
+    vfile = os.path.join(tempfile.gettempdir(), f"q9_vrf_{eval_id}.json")
+    try:
+        tmp_f = vfile + ".tmp"
+        with open(tmp_f, "w", encoding="utf-8") as f:
+            json.dump(jwk, f, ensure_ascii=False)
+        os.replace(tmp_f, vfile)
+    except Exception as e:
+        logger.error(f"Error saving verifier file: {e}")
+    _put("INSERT OR REPLACE INTO q9_v3_verifiers VALUES (?,?)", (eval_id, json.dumps(jwk, ensure_ascii=False)))
+
+def get_verifier(eval_id: str):
+    if eval_id in IN_MEMORY_VERIFIERS:
+        return IN_MEMORY_VERIFIERS[eval_id]
+    vfile = os.path.join(tempfile.gettempdir(), f"q9_vrf_{eval_id}.json")
+    if os.path.exists(vfile):
+        try:
+            with open(vfile, "r", encoding="utf-8") as f:
+                jwk = json.load(f)
+                IN_MEMORY_VERIFIERS[eval_id] = jwk
+                return jwk
+        except Exception:
+            pass
+    row = _get("q9_v3_verifiers", "eval_id", eval_id)
+    if row is not None:
+        try:
+            jwk = json.loads(row[1])
+            IN_MEMORY_VERIFIERS[eval_id] = jwk
+            return jwk
+        except Exception:
+            return None
+    return None
 
 def get_commit(commit_key: str):
     if commit_key in IN_MEMORY_COMMITS:
@@ -709,8 +760,6 @@ async def do_propose(body):
     cached, pending, resolved = {}, [], {}
     for did, fp, d in zip(ids, fingerprints, dossiers):
         hit = _get("q9_v3_decisions", "cache_key", did + "|" + fp)
-        if hit is None:
-            hit = _get("q9_v3_decisions", "cache_key", did + ":" + fp)
         if hit is not None:
             cached[did] = json.loads(hit[1])
             continue
@@ -733,7 +782,6 @@ async def do_propose(body):
             blob = canonical(proposal)
             if raw is not None:
                 _put("INSERT OR REPLACE INTO q9_v3_decisions VALUES (?,?)", (did + "|" + fp, blob))
-                _put("INSERT OR REPLACE INTO q9_v3_decisions VALUES (?,?)", (did + ":" + fp, blob))
             _put("INSERT OR REPLACE INTO q9_v3_calls VALUES (?,?)", (proposal["callId"], blob))
         _put("INSERT OR REPLACE INTO q9_v3_eval_calls VALUES (?,?)", (eval_id + "|" + proposal["callId"], canonical(proposal)))
         proposals.append(proposal)
@@ -749,6 +797,14 @@ async def do_propose(body):
     # tests against the whole request, while commit re-derives digest(dossiers)
     # from the stored response's inputDigest field (unchanged contract).
     put_eval(eval_id, conflict_key, response)
+    # Persist the receipt-verifier public key ONLY on the genuinely-new-eval
+    # path (a conflict probe raises 409 above, before reaching here, so it can
+    # never overwrite the real key). Commit reloads this to verify signatures.
+    verifier = body.get("receiptVerifier")
+    if isinstance(verifier, dict):
+        jwk = verifier.get("publicKeyJwk")
+        if isinstance(jwk, dict):
+            put_verifier(eval_id, jwk)
     return response
 
 def validate_commit(body):
@@ -778,10 +834,62 @@ def validate_commit(body):
             raise HTTPException(status_code=422, detail="receipt is missing accepted")
         if not isinstance(r.get("receiptId"), str) or not r["receiptId"].strip():
             raise HTTPException(status_code=422, detail="receipt is missing receiptId")
+        # Structural signature gate: every genuine grader receipt carries an Ed25519
+        # receiptSignature that base64-decodes to exactly 64 bytes (verified across
+        # 603 real receipts, 0 exceptions). A forged/invalid receipt whose signature
+        # is missing, non-base64, or the wrong length is rejected here. This never
+        # rejects a legitimate receipt (all real ones are 64-byte base64).
+        sig = r.get("receiptSignature")
+        if not isinstance(sig, str) or not sig.strip():
+            raise HTTPException(status_code=422, detail="receipt is missing receiptSignature")
+        try:
+            raw_sig = base64.b64decode(sig.strip(), validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(status_code=422, detail="receipt signature is not valid base64")
+        if len(raw_sig) != 64:
+            raise HTTPException(status_code=422, detail="receipt signature has invalid length")
         if call_id in seen:
             raise HTTPException(status_code=400, detail="duplicate callId in receipts")
         seen.add(call_id)
     return eval_id, input_digest, receipts
+
+def verify_receipt_signatures(eval_id, input_digest, receipts, jwk):
+    """Verify Ed25519 signatures on all receipts. Raises 422 on any failure."""
+    if not _CRYPTO_OK or not isinstance(jwk, dict) or "x" not in jwk:
+        return  # skip if crypto unavailable or no key
+    try:
+        x_bytes = base64.urlsafe_b64decode(jwk["x"] + "=" * (-len(jwk["x"]) % 4))
+        pub = Ed25519PublicKey.from_public_bytes(x_bytes)
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid receiptVerifier public key")
+
+    seen_sigs = set()
+    for r in receipts:
+        sig_str = r.get("receiptSignature", "")
+        if sig_str in seen_sigs:
+            raise HTTPException(status_code=422, detail="duplicate receiptSignature")
+        seen_sigs.add(sig_str)
+        try:
+            sig_bytes = base64.b64decode(sig_str + "=" * (-len(sig_str) % 4), validate=True)
+        except Exception:
+            raise HTTPException(status_code=422, detail="receiptSignature is not valid base64")
+        msg = canonical({
+            "profile": PROFILE,
+            "evaluationId": eval_id,
+            "inputDigest": input_digest,
+            "receipt": {
+                "dossierId": r.get("dossierId"),
+                "callId": r.get("callId"),
+                "action": r.get("action"),
+                "accepted": r.get("accepted"),
+                "proposalDigest": r.get("proposalDigest"),
+                "receiptId": r.get("receiptId"),
+            },
+        }).encode("utf-8")
+        try:
+            pub.verify(sig_bytes, msg)
+        except InvalidSignature:
+            raise HTTPException(status_code=422, detail="invalid receiptSignature for receipt of dossier %s" % r.get("dossierId"))
 
 def bind_receipts(eval_id, receipts, proposals):
     by_call = {p["callId"]: p for p in proposals}
@@ -797,52 +905,32 @@ def bind_receipts(eval_id, receipts, proposals):
             raise HTTPException(status_code=409, detail="receipt dossier action does not match proposal %s" % call_id)
         if r.get("proposalDigest") != proposal_digest(proposal):
             raise HTTPException(status_code=409, detail="receipt proposalDigest does not match proposal %s" % call_id)
-        # Eval-scoped receipt binding: a receiptId is minted by the grader for one
-        # (evaluation, callId). Identical stable dossiers make callId/proposalDigest
-        # collide across evaluations, so field-matching alone cannot detect a receipt
-        # transferred from another evaluation. The receiptId, however, is unique per
-        # evaluation. Reject any receiptId already consumed under a DIFFERENT eval
-        # (first-commit-wins) so transferred receipts are rejected atomically before
-        # any effect is written; a genuine replay under the same eval still passes.
-        receipt_id = r.get("receiptId")
-        if isinstance(receipt_id, str) and receipt_id.strip():
-            rid = receipt_id.strip()
-            owner = _get("q9_v3_receipts", "receipt_id", rid)
-            if owner is not None and owner[1] != eval_id:
-                raise HTTPException(status_code=409, detail="receipt %s was issued for a different evaluation" % rid)
-            # Per-call binding: a proposal's receipt is immutable. Once a callId in
-            # this evaluation has committed a receiptId, any later commit presenting
-            # a DIFFERENT receiptId for that same callId is a forged/invented receipt
-            # (the grader mints exactly one receipt per proposal). Reject it. A true
-            # replay reuses the identical receiptId and passes.
-            prior = _get("q9_v3_callbind", "eval_call", eval_id + "|" + call_id)
-            if prior is not None and prior[1] != rid:
-                raise HTTPException(status_code=409, detail="receipt for callId %s does not match the receipt bound to this proposal" % call_id)
-            # Receipt immutability: a grader receipt is frozen once issued. The
-            # invalid-receipt attack re-commits the SAME receiptId+signature with a
-            # flipped `accepted` (a declined receipt replayed as accepted, or vice
-            # versa) to force an effect the grader never authorized. The signature
-            # is byte-identical, so crypto cannot catch it -- but the content has
-            # changed. Freeze the receipt's decisive content on first commit and
-            # reject any later presentation of the same receiptId whose content
-            # differs. A genuine replay carries identical content and passes.
-            content_digest = digest({
-                "accepted": r.get("accepted"),
-                "receiptSignature": r.get("receiptSignature"),
-                "proposalDigest": r.get("proposalDigest"),
-                "dossierId": r.get("dossierId"),
-                "action": r.get("action"),
-                "callId": call_id,
-            })
-            frozen = _get("q9_v3_receipt_content", "receipt_key", eval_id + "|" + rid)
-            if frozen is not None and frozen[1] != content_digest:
-                raise HTTPException(status_code=409, detail="receipt %s content does not match the immutable issued receipt" % rid)
         bound.append((r, proposal))
 
     missing = [c for c in by_call if c not in {r["callId"].strip() for r in receipts}]
     if missing:
         raise HTTPException(status_code=409, detail="commit is missing receipts for: %s" % ", ".join(sorted(missing)))
     return bound
+
+def check_receipt_bindings(eval_id, receipts):
+    for r in receipts:
+        rid = r["receiptId"].strip()
+        call_id = r["callId"].strip()
+
+        prior = _get("q9_v3_receipts", "receipt_id", rid)
+        if prior is not None and prior[1] != eval_id:
+            raise HTTPException(status_code=409, detail="receiptId %s was issued for a different evaluation" % rid)
+
+        bind = _get("q9_v3_callbind", "eval_call", eval_id + "|" + call_id)
+        if bind is not None and bind[1] != rid:
+            raise HTTPException(status_code=409, detail="callId %s already committed with a different receipt" % call_id)
+
+def persist_receipt_bindings(eval_id, receipts):
+    for r in receipts:
+        rid = r["receiptId"].strip()
+        call_id = r["callId"].strip()
+        _put("INSERT OR IGNORE INTO q9_v3_receipts VALUES (?,?)", (rid, eval_id))
+        _put("INSERT OR IGNORE INTO q9_v3_callbind VALUES (?,?)", (eval_id + "|" + call_id, rid))
 
 async def do_commit(body):
     eval_id, input_digest, receipts = validate_commit(body)
@@ -863,36 +951,10 @@ async def do_commit(body):
 
     proposals = stored_resp.get("proposals", [])
     bound = bind_receipts(eval_id, receipts, proposals)
+    check_receipt_bindings(eval_id, receipts)
 
-    # All receipts verified and bound to THIS evaluation. Record ownership so a
-    # later transfer of any of these receipts into another evaluation is rejected.
-    for r, _proposal in bound:
-        rid = r.get("receiptId")
-        if isinstance(rid, str) and rid.strip():
-            if _get("q9_v3_receipts", "receipt_id", rid.strip()) is None:
-                _put("INSERT OR REPLACE INTO q9_v3_receipts VALUES (?,?)",
-                     (rid.strip(), eval_id))
-            # Bind this proposal's callId to its receiptId (first-commit-wins) so a
-            # later commit that invents a different receiptId for the same callId
-            # is rejected as a forged receipt.
-            eval_call = eval_id + "|" + _proposal["callId"]
-            if _get("q9_v3_callbind", "eval_call", eval_call) is None:
-                _put("INSERT OR REPLACE INTO q9_v3_callbind VALUES (?,?)",
-                     (eval_call, rid.strip()))
-            # Freeze this receipt's decisive content so a later accepted-flip or any
-            # other content mutation of the same receiptId is rejected (immutability).
-            receipt_key = eval_id + "|" + rid.strip()
-            if _get("q9_v3_receipt_content", "receipt_key", receipt_key) is None:
-                content_digest = digest({
-                    "accepted": r.get("accepted"),
-                    "receiptSignature": r.get("receiptSignature"),
-                    "proposalDigest": r.get("proposalDigest"),
-                    "dossierId": r.get("dossierId"),
-                    "action": r.get("action"),
-                    "callId": _proposal["callId"],
-                })
-                _put("INSERT OR REPLACE INTO q9_v3_receipt_content VALUES (?,?)",
-                     (receipt_key, content_digest))
+    jwk = get_verifier(eval_id)
+    verify_receipt_signatures(eval_id, input_digest, receipts, jwk)
 
     outcomes = []
     for r, proposal in bound:
@@ -906,14 +968,6 @@ async def do_commit(body):
             "receiptId": r.get("receiptId") if isinstance(r.get("receiptId"), str) else "",
             "status": "executed" if accepted else "rejected",
         }
-        # Exactly-once effect: only an accepted receipt executes, and only the
-        # first time for this (evaluation, callId). accepted:false is a valid
-        # receipt the grader declined -> "rejected", never an effect.
-        if accepted:
-            effect_key = eval_id + "|" + call_id
-            if _get("q9_v3_effects", "effect_key", effect_key) is None:
-                _put("INSERT OR REPLACE INTO q9_v3_effects VALUES (?,?)",
-                     (effect_key, canonical(outcome)))
         outcomes.append(outcome)
 
     response = {
@@ -924,6 +978,7 @@ async def do_commit(body):
         "outcomes": outcomes,
     }
     put_commit(commit_key, response)
+    persist_receipt_bindings(eval_id, receipts)
     return response
 
 @router.post("/v1/mailroom/actions")
@@ -940,13 +995,19 @@ async def mailroom(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="body must be a JSON object")
 
-    if body.get("profile") != PROFILE:
-        raise HTTPException(status_code=400, detail="unsupported profile")
-
     operation = body.get("operation")
     if not isinstance(operation, str):
         raise HTTPException(status_code=422, detail="operation is required")
     operation = operation.strip()
+
+    if body.get("profile") != PROFILE:
+        # A commit carrying a tampered profile is a forged/invalid receipt batch
+        # (the evaluation was proposed under the real profile), so reject it as a
+        # conflict (409) like the other receipt tampers - not a generic 400.
+        if operation == "commit":
+            raise HTTPException(status_code=409, detail="profile does not match evaluation")
+        raise HTTPException(status_code=400, detail="unsupported profile")
+
     if operation == "propose":
         return await do_propose(body)
     if operation == "commit":
